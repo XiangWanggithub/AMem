@@ -1,0 +1,12 @@
+# Memory Eval Pipeline 依赖
+openai>=1.0.0
+numpy>=1.24.0
+
+# Mem0 记忆系统（可选，不安装则跳过 mem0 策略）
+# mem0ai>=0.1.0
+
+# OpenViking（可选，接入火山引擎记忆系统）
+# openviking
+
+# 如果要用本地 embedding（替代 OpenAI embedding 节省费用）
+# sentence-transformers>=2.2.0

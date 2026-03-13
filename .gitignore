@@ -1,0 +1,20 @@
+# API keys，绝对不要提交
+.env
+
+# 数据集（太大）
+data/
+
+# 结果文件（可选择性提交）
+results/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+
+# 模型缓存
+*.bin
+*.pt
+*.safetensors

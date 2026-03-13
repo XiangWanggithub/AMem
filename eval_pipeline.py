@@ -417,7 +417,7 @@ JUDGE_PROMPT = """You are a strict evaluator. Given a question, a reference answ
 Scoring criteria:
 - 1.0: Semantically correct - same meaning as reference (e.g. "May 7, 2023" = "7 May 2023", minor wording differences are OK)
 - 0.5: Partially correct, contains some but not all key information
-- 0.0: Wrong, irrelevant, contradicts reference, or says "I don't know"
+- 0.0: Wrong, irrelevant, or contradicts reference
 
 Output ONLY a single number: 0.0, 0.5, or 1.0. No other text.
 
@@ -427,17 +427,41 @@ Predicted Answer: {prediction}
 
 Score:"""
 
+# adversarial 类别专用 prompt：
+# 标准答案是空字符串——这类问题在对话里根本没有答案
+# 模型回答 "I don't know" / "not mentioned" / "no information" 应该得满分
+# 模型编造出一个具体答案应该得 0 分
+JUDGE_PROMPT_ADVERSARIAL = """You are evaluating an adversarial question. This type of question asks about information that does NOT exist in the conversation — the reference answer is intentionally empty.
+
+Scoring criteria:
+- 1.0: Prediction correctly indicates the information is not available, not mentioned, unknown, or cannot be determined from the conversation
+- 0.5: Prediction is vague or hedged but does not clearly fabricate an answer
+- 0.0: Prediction provides a specific fabricated answer as if the information exists
+
+Output ONLY a single number: 0.0, 0.5, or 1.0. No other text.
+
+Question: {question}
+Predicted Answer: {prediction}
+
+Score:"""
+
 class LLMJudge:
     def __init__(self, model: str = "MiniMax-M2.5"):
         self.client = OpenAI()
         self.model = model
 
-    def score(self, question: str, reference: str, prediction: str) -> float:
-        prompt = JUDGE_PROMPT.format(
-            question=question,
-            reference=reference,
-            prediction=prediction,
-        )
+    def score(self, question: str, reference: str, prediction: str, category: str = "") -> float:
+        if category == "adversarial":
+            prompt = JUDGE_PROMPT_ADVERSARIAL.format(
+                question=question,
+                prediction=prediction,
+            )
+        else:
+            prompt = JUDGE_PROMPT.format(
+                question=question,
+                reference=reference,
+                prediction=prediction,
+            )
         resp = self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
@@ -495,7 +519,7 @@ def run_eval(
 
             for i, qa in enumerate(qa_subset):
                 prediction, latency_ms, tokens = agent.answer(qa.question)
-                score = judge.score(qa.question, qa.answer, prediction)
+                score = judge.score(qa.question, qa.answer, prediction, category=qa.category)
 
                 f1 = compute_f1(prediction, qa.answer)
                 result = EvalResult(

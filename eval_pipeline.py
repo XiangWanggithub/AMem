@@ -48,7 +48,8 @@ class Turn:
     speaker: str
     text: str
     session_idx: int
-    session_date: str = ""   # session 的时间戳，如 "8 May 2023"
+    session_date: str = ""   # session 的时间戳，如 "1:56 pm on 8 May, 2023"
+    blip_caption: str = ""  # 图片的 BLIP 描述（无图片时为空）
 
 @dataclass
 class QA:
@@ -114,7 +115,9 @@ def load_locomo(path: str) -> list[Conversation]:
                 speaker = turn.get("name", turn.get("speaker", "unknown"))
                 text = turn.get("text", turn.get("dialog", ""))
                 if text:
-                    turns.append(Turn(speaker=speaker, text=text, session_idx=idx, session_date=session_date))
+                    blip_caption = turn.get("blip_caption", "")
+                    turns.append(Turn(speaker=speaker, text=text, session_idx=idx,
+                                      session_date=session_date, blip_caption=blip_caption))
 
         # 解析 QA
         qa_list = []
@@ -147,7 +150,7 @@ class MemoryStrategy(ABC):
         ...
 
     @abstractmethod
-    def observe(self, speaker: str, text: str, session_date: str = "", session_idx: int = -1):
+    def observe(self, speaker: str, text: str, session_date: str = "", session_idx: int = -1, blip_caption: str = ""):
         """记录一轮对话"""
         ...
 
@@ -173,7 +176,7 @@ class NoMemory(MemoryStrategy):
 
     def reset(self): pass
 
-    def observe(self, speaker: str, text: str, session_date: str = "", session_idx: int = -1): pass
+    def observe(self, speaker: str, text: str, session_date: str = "", session_idx: int = -1, blip_caption: str = ""): pass
 
     def retrieve(self, query: str) -> str:
         return ""  # 完全没有上下文
@@ -196,12 +199,16 @@ class FullHistory(MemoryStrategy):
         self.history = []
         self._last_session_idx = -1
 
-    def observe(self, speaker: str, text: str, session_date: str = "", session_idx: int = -1):
-        # 每个 session 开头插入时间标记
+    def observe(self, speaker: str, text: str, session_date: str = "", session_idx: int = -1, blip_caption: str = ""):
+        # 每个 session 开头插入时间标记（对齐 LoCoMo 官方格式）
         if session_date and (not self.history or self._last_session_idx != session_idx):
-            self.history.append(f"\n[Session Date: {session_date}]")
+            self.history.append(f"\n[{session_date}]")
             self._last_session_idx = session_idx
-        self.history.append(f"{speaker}: {text}")
+        # 对话格式：speaker said, "text" [and shared <blip>]（对齐官方 dialog 格式）
+        entry = f'{speaker} said, "{text}"'
+        if blip_caption:
+            entry += f" and shared {blip_caption}"
+        self.history.append(entry)
 
     def retrieve(self, query: str) -> str:
         full = "\n".join(self.history)
@@ -239,10 +246,12 @@ class RAGMemory(MemoryStrategy):
     def _embed(self, text: str):
         return self._st_model.encode(text, normalize_embeddings=True).tolist()
 
-    def observe(self, speaker: str, text: str, session_date: str = "", session_idx: int = -1):
-        # 在 chunk 里也加入时间标记，提升时序类问题的检索准确率
-        prefix = f"[{session_date}] " if session_date else ""
-        chunk = f"{prefix}{speaker}: {text}"
+    def observe(self, speaker: str, text: str, session_date: str = "", session_idx: int = -1, blip_caption: str = ""):
+        # 对齐 LoCoMo 官方 dialog 格式：日期前缀 + speaker said, "text" [and shared <blip>]
+        entry = f'{speaker} said, "{text}"'
+        if blip_caption:
+            entry += f" and shared {blip_caption}"
+        chunk = f"{session_date}: {entry}" if session_date else entry
         self.chunks.append(chunk)
         self.embeddings.append(self._embed(chunk))
 
@@ -288,11 +297,16 @@ class Mem0Memory(MemoryStrategy):
         # 新对话用新 user_id 隔离
         self.user_id = f"eval_user_{int(time.time())}"
 
-    def observe(self, speaker: str, text: str, session_date: str = "", session_idx: int = -1):
+    def observe(self, speaker: str, text: str, session_date: str = "", session_idx: int = -1, blip_caption: str = ""):
         if not self.available:
             return
+        # 拼入时间和图片信息，让 Mem0 提取 facts 时有时间上下文
+        content = text
+        if blip_caption:
+            content += f" [shared image: {blip_caption}]"
+        prefix = f"[{session_date}] " if session_date else ""
         self.mem.add(
-            messages=[{"role": "user" if speaker != "agent" else "assistant", "content": text}],
+            messages=[{"role": "user" if speaker != "agent" else "assistant", "content": prefix + content}],
             user_id=self.user_id,
         )
 
@@ -326,7 +340,7 @@ class AgentLoop:
         """重放对话历史，让 memory 系统学习"""
         self.memory.reset()
         for turn in turns:
-            self.memory.observe(turn.speaker, turn.text, turn.session_date, turn.session_idx)
+            self.memory.observe(turn.speaker, turn.text, turn.session_date, turn.session_idx, turn.blip_caption)
 
     def answer(self, question: str) -> tuple[str, float, int]:
         """回答一个 probe 问题，返回 (answer, latency_ms, tokens)"""

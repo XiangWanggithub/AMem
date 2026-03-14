@@ -359,7 +359,7 @@ class AgentLoop:
             model=self.model,
             messages=messages,
             temperature=0,
-            max_tokens=256,
+            max_tokens=1024,  # enough for answer + think
         )
         latency_ms = (time.time() - t0) * 1000
         tokens = resp.usage.total_tokens
@@ -412,38 +412,32 @@ def compute_f1(prediction: str, reference: str) -> float:
     recall = num_same / len(ref_tokens)
     return (2 * precision * recall) / (precision + recall)
 
-JUDGE_PROMPT = """You are a strict evaluator. Given a question, a reference answer, and a predicted answer, judge whether the prediction is correct.
+JUDGE_PROMPT = """Score the prediction against the reference. Do not think, do not explain. Output only the number.
 
-Scoring criteria:
-- 1.0: Semantically correct - same meaning as reference (e.g. "May 7, 2023" = "7 May 2023", minor wording differences are OK)
-- 0.5: Partially correct, contains some but not all key information
-- 0.0: Wrong, irrelevant, or contradicts reference
-
-Output ONLY a single number: 0.0, 0.5, or 1.0. No other text.
+- 1.0: Semantically correct (e.g. "May 7, 2023" = "7 May 2023", minor wording OK)
+- 0.5: Partially correct
+- 0.0: Wrong or irrelevant
 
 Question: {question}
-Reference Answer: {reference}
-Predicted Answer: {prediction}
+Reference: {reference}
+Prediction: {prediction}
 
-Score:"""
+Output only: 0.0, 0.5, or 1.0"""
 
 # adversarial 类别专用 prompt：
 # 标准答案是空字符串——这类问题在对话里根本没有答案
 # 模型回答 "I don't know" / "not mentioned" / "no information" 应该得满分
 # 模型编造出一个具体答案应该得 0 分
-JUDGE_PROMPT_ADVERSARIAL = """You are evaluating an adversarial question. This type of question asks about information that does NOT exist in the conversation — the reference answer is intentionally empty.
+JUDGE_PROMPT_ADVERSARIAL = """This question has NO correct answer in the conversation. Do not think, do not explain. Output only the number.
 
-Scoring criteria:
-- 1.0: Prediction correctly indicates the information is not available, not mentioned, unknown, or cannot be determined from the conversation
-- 0.5: Prediction is vague or hedged but does not clearly fabricate an answer
-- 0.0: Prediction provides a specific fabricated answer as if the information exists
-
-Output ONLY a single number: 0.0, 0.5, or 1.0. No other text.
+- 1.0: Prediction says it doesn't know / not mentioned / no information
+- 0.5: Prediction is vague or uncertain
+- 0.0: Prediction gives a specific fabricated answer
 
 Question: {question}
-Predicted Answer: {prediction}
+Prediction: {prediction}
 
-Score:"""
+Output only: 0.0, 0.5, or 1.0"""
 
 class LLMJudge:
     def __init__(self, model: str = "MiniMax-M2.5"):
@@ -466,22 +460,23 @@ class LLMJudge:
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
-            max_tokens=512,  # 给 thinking 模型留足空间
+            max_tokens=4096,  # thinking 模型 <think> 内容可能很长
         )
         raw = resp.choices[0].message.content.strip()
-        # 剥离 <think>...</think> 推理过程
+        # Strip <think>...</think> and extract score
         import re as _re
-        cleaned = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL).strip()
-        # 从剩余文本里提取第一个 0.0 / 0.5 / 1.0
-        match = _re.search(r"\b(1\.0|0\.5|0\.0|1|0)\b", cleaned)
+        # Priority: search directly in raw (handles truncated output)
+        match = _re.search(r"\b(1\.0|0\.5|0\.0)\b", raw)
         if match:
             return float(match.group(1))
-        # fallback: 尝试直接转换
-        try:
-            return float(cleaned)
-        except ValueError:
-            print(f"    [judge warn] 无法解析得分: {raw[:80]!r}")
-            return 0.0
+        # Fallback: try cleaning then search
+        cleaned = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL).strip()
+        match = _re.search(r"\b(1\.0|0\.5|0\.0)\b", cleaned)
+        if match:
+            return float(match.group(1))
+        # Failed
+        print(f"    [judge warn] cannot parse score: {raw[:80]!r}")
+        return 0.0
 
 # ─────────────────────────────────────────────
 # 评测主流程

@@ -412,17 +412,20 @@ def compute_f1(prediction: str, reference: str) -> float:
     recall = num_same / len(ref_tokens)
     return (2 * precision * recall) / (precision + recall)
 
-JUDGE_PROMPT = """Score the prediction against the reference. Do not think, do not explain. Output only the number.
+JUDGE_PROMPT = """Score the prediction against the reference answer. Output only a number: 0.0, 0.5, or 1.0.
 
-- 1.0: Semantically correct (e.g. "May 7, 2023" = "7 May 2023", minor wording OK)
-- 0.5: Partially correct
-- 0.0: Wrong or irrelevant
+Rules:
+- 1.0: Prediction is semantically correct (e.g. "May 7, 2023" = "7 May 2023", minor wording OK)
+- 0.5: Prediction is partially correct (contains some but not all key info)
+- 0.0: Prediction is wrong, irrelevant, or says "I don't know" / "no information" / "not provided"
+
+Important: If the prediction says it does not know or has no information, score is always 0.0.
 
 Question: {question}
 Reference: {reference}
 Prediction: {prediction}
 
-Output only: 0.0, 0.5, or 1.0"""
+Score (0.0, 0.5, or 1.0):"""
 
 # adversarial 类别专用 prompt：
 # 标准答案是空字符串——这类问题在对话里根本没有答案
@@ -514,7 +517,15 @@ def run_eval(
 
             for i, qa in enumerate(qa_subset):
                 prediction, latency_ms, tokens = agent.answer(qa.question)
-                score = judge.score(qa.question, qa.answer, prediction, category=qa.category)
+                # Hard rule: non-adversarial + "I don't know" style answer = 0.0
+                _idk_phrases = ("i don't know", "i do not know", "no information",
+                                "not provided", "not mentioned", "no context",
+                                "cannot determine", "no memory")
+                if (qa.category != "adversarial"
+                        and any(p in prediction.lower() for p in _idk_phrases)):
+                    score = 0.0
+                else:
+                    score = judge.score(qa.question, qa.answer, prediction, category=qa.category)
 
                 f1 = compute_f1(prediction, qa.answer)
                 result = EvalResult(

@@ -468,15 +468,15 @@ class LLMJudge:
         raw = resp.choices[0].message.content.strip()
         # Strip <think>...</think> and extract score
         import re as _re
-        # Priority: search directly in raw (handles truncated output)
-        match = _re.search(r"\b(1\.0|0\.5|0\.0)\b", raw)
-        if match:
-            return float(match.group(1))
-        # Fallback: try cleaning then search
+        # Step 1: strip complete <think>...</think> block, then search
         cleaned = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL).strip()
         match = _re.search(r"\b(1\.0|0\.5|0\.0)\b", cleaned)
         if match:
             return float(match.group(1))
+        # Step 2: <think> not closed (truncated output) — take LAST number in raw
+        matches = _re.findall(r"\b(1\.0|0\.5|0\.0)\b", raw)
+        if matches:
+            return float(matches[-1])
         # Failed
         print(f"    [judge warn] cannot parse score: {raw[:80]!r}")
         return 0.0
@@ -517,15 +517,7 @@ def run_eval(
 
             for i, qa in enumerate(qa_subset):
                 prediction, latency_ms, tokens = agent.answer(qa.question)
-                # Hard rule: non-adversarial + "I don't know" style answer = 0.0
-                _idk_phrases = ("i don't know", "i do not know", "no information",
-                                "not provided", "not mentioned", "no context",
-                                "cannot determine", "no memory")
-                if (qa.category != "adversarial"
-                        and any(p in prediction.lower() for p in _idk_phrases)):
-                    score = 0.0
-                else:
-                    score = judge.score(qa.question, qa.answer, prediction, category=qa.category)
+                score = judge.score(qa.question, qa.answer, prediction, category=qa.category)
 
                 f1 = compute_f1(prediction, qa.answer)
                 result = EvalResult(

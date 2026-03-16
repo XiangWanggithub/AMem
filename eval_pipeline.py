@@ -296,6 +296,7 @@ class RAGMemory(MemoryStrategy):
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=128,
                 temperature=0,
+                timeout=30,
             )
             raw = resp.choices[0].message.content.strip()
             import re as _re
@@ -329,48 +330,110 @@ class RAGMemory(MemoryStrategy):
 
 class Mem0Memory(MemoryStrategy):
     """
-    Mem0 记忆系统。
+    Mem0 记忆系统 - 本地模式（MiniMax LLM + bge embedder）。
     依赖: pip install mem0ai
-    需要设置环境变量: MEM0_API_KEY 或 OPENAI_API_KEY（本地模式）
+    使用 OPENAI_API_KEY / OPENAI_BASE_URL 环境变量指向 MiniMax API。
+    改进：
+    - 使用 Memory.from_config() 指定本地 LLM + bge-large embedder
+    - observe() 只收集 turns，replay 结束后调 flush() 批量 add（session 级别）
+    - reset() 真正删除旧 facts，避免跨对话污染
     """
 
-    def __init__(self, user_id: str = "eval_user"):
+    def __init__(self, user_id: str = "eval_user",
+                 embedding_model: str = "/home/models/bge-large-en-v1.5"):
+        import os
+        self.user_id = user_id
+        self._session_buffer: dict[int, list] = {}
+        self.available = False
         try:
             from mem0 import Memory
-            self.mem = Memory()
-            self.user_id = user_id
+            config = {
+                "llm": {
+                    "provider": "openai",
+                    "config": {
+                        "model": "MiniMax-M2.5",
+                        "openai_api_key": os.environ.get("OPENAI_API_KEY", ""),
+                        "openai_api_base": os.environ.get("OPENAI_BASE_URL", ""),
+                    }
+                },
+                "embedder": {
+                    "provider": "huggingface",
+                    "config": {
+                        "model": embedding_model,
+                    }
+                },
+                "vector_store": {
+                    "provider": "qdrant",
+                    "config": {
+                        "collection_name": "mem0_eval",
+                        "on_disk": False,
+                    }
+                }
+            }
+            self.mem = Memory.from_config(config)
             self.available = True
+            print(f"[Mem0Memory] initialized with MiniMax LLM + {embedding_model}")
         except ImportError:
-            print("[Mem0Memory] mem0ai 未安装，跳过。pip install mem0ai")
-            self.available = False
+            print("[Mem0Memory] mem0ai not installed. pip install mem0ai")
+        except Exception as e:
+            print(f"[Mem0Memory] init failed: {e}")
 
     @property
     def name(self): return "mem0"
 
     def reset(self):
-        # 新对话用新 user_id 隔离
-        self.user_id = f"eval_user_{int(time.time())}"
-
-    def observe(self, speaker: str, text: str, session_date: str = "", session_idx: int = -1, blip_caption: str = ""):
         if not self.available:
             return
-        # 拼入时间和图片信息，让 Mem0 提取 facts 时有时间上下文
+        # 真正删除旧 user 的 facts，避免跨对话污染
+        old_uid = self.user_id
+        self.user_id = f"eval_user_{int(time.time())}"
+        self._session_buffer = {}
+        try:
+            self.mem.delete_all(user_id=old_uid)
+        except Exception:
+            pass
+
+    def observe(self, speaker: str, text: str, session_date: str = "", session_idx: int = -1, blip_caption: str = ""):
+        # 只收集 turns，不调 LLM；replay 结束后调 flush() 批量处理
+        if not self.available:
+            return
         content = text
         if blip_caption:
             content += f" [shared image: {blip_caption}]"
         prefix = f"[{session_date}] " if session_date else ""
-        self.mem.add(
-            messages=[{"role": "user" if speaker != "agent" else "assistant", "content": prefix + content}],
-            user_id=self.user_id,
+        role = "assistant" if speaker == "agent" else "user"
+        if session_idx not in self._session_buffer:
+            self._session_buffer[session_idx] = []
+        self._session_buffer[session_idx].append(
+            {"role": role, "content": prefix + content}
         )
+
+    def flush(self):
+        """replay 结束后调用：按 session 批量 add，每个 session 一次 LLM 调用提取 facts"""
+        if not self.available or not self._session_buffer:
+            return
+        total = len(self._session_buffer)
+        for i, idx in enumerate(sorted(self._session_buffer.keys())):
+            messages = self._session_buffer[idx]
+            try:
+                self.mem.add(messages=messages, user_id=self.user_id)
+                print(f"[Mem0Memory] flush session {i+1}/{total} (idx={idx}, turns={len(messages)})")
+            except Exception as e:
+                print(f"[Mem0Memory] flush session {idx} error: {e}")
+        self._session_buffer = {}
 
     def retrieve(self, query: str, client=None) -> str:
         if not self.available:
             return ""
-        results = self.mem.search(query=query, user_id=self.user_id, limit=5)
+        try:
+            results = self.mem.search(query=query, user_id=self.user_id, limit=5)
+        except Exception as e:
+            print(f"[Mem0Memory] search error: {e}")
+            return ""
         if not results:
             return ""
-        memories = results if isinstance(results, list) else results.get("results", [])
+        # mem0ai 1.x 返回 {"results": [...]}，兼容旧版 list
+        memories = results.get("results", results) if isinstance(results, dict) else results
         return "\n".join(
             m.get("memory", m.get("text", str(m))) for m in memories
         )
@@ -395,6 +458,9 @@ class AgentLoop:
         self.memory.reset()
         for turn in turns:
             self.memory.observe(turn.speaker, turn.text, turn.session_date, turn.session_idx, turn.blip_caption)
+        # Mem0Memory: observe only collects turns, flush() batch-adds after replay
+        if hasattr(self.memory, "flush"):
+            self.memory.flush()
 
     def answer(self, question: str) -> tuple[str, float, int]:
         """回答一个 probe 问题，返回 (answer, latency_ms, tokens)"""
@@ -418,6 +484,7 @@ class AgentLoop:
             messages=messages,
             temperature=0,
             max_tokens=1024,  # enough for answer + think
+            timeout=60,
         )
         latency_ms = (time.time() - t0) * 1000
         tokens = resp.usage.total_tokens
@@ -522,6 +589,7 @@ class LLMJudge:
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
             max_tokens=4096,  # thinking 模型 <think> 内容可能很长
+            timeout=90,
         )
         raw = resp.choices[0].message.content.strip()
         # Strip <think>...</think> and extract score
@@ -574,8 +642,16 @@ def run_eval(
             qa_subset = qa_subset[:max_qa_per_conv]
 
             for i, qa in enumerate(qa_subset):
-                prediction, latency_ms, tokens = agent.answer(qa.question)
-                score = judge.score(qa.question, qa.answer, prediction, category=qa.category)
+                try:
+                    prediction, latency_ms, tokens = agent.answer(qa.question)
+                except Exception as e:
+                    print(f"    [answer error] {type(e).__name__}: {str(e)[:60]}, skipping")
+                    prediction, latency_ms, tokens = "", 0.0, 0
+                try:
+                    score = judge.score(qa.question, qa.answer, prediction, category=qa.category)
+                except Exception as e:
+                    print(f"    [judge error] {type(e).__name__}: {str(e)[:60]}, defaulting 0.0")
+                    score = 0.0
 
                 f1 = compute_f1(prediction, qa.answer)
                 result = EvalResult(

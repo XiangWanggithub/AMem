@@ -366,7 +366,7 @@ class Mem0Memory(MemoryStrategy):
                     "provider": "qdrant",
                     "config": {
                         "collection_name": "mem0_eval_bge1024",
-                        "on_disk": False,
+                        "on_disk": True,
                         "embedding_model_dims": 1024,
                     }
                 }
@@ -423,7 +423,7 @@ class Mem0Memory(MemoryStrategy):
             def patched_generate(messages, response_format=None, tools=None, tool_choice="auto", **kwargs):
                 # Inject reasoning_split and bump max_tokens
                 kwargs["extra_body"] = {"reasoning_split": True}
-                kwargs["max_tokens"] = 4096
+                kwargs["max_tokens"] = 8192
                 # Retry up to 3 times on empty response (MiniMax API occasional empty returns)
                 for attempt in range(3):
                     result = original_generate(

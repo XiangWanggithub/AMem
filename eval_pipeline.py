@@ -372,6 +372,10 @@ class Mem0Memory(MemoryStrategy):
                 }
             }
             self.mem = Memory.from_config(config)
+            # Monkey-patch LLM generate_response to:
+            # 1. Add reasoning_split=True so <think> goes to reasoning_details, not content
+            # 2. Increase max_tokens to 4096 so thinking doesn't eat all output tokens
+            self._patch_mem0_llm()
             self.available = True
             print(f"[Mem0Memory] initialized with MiniMax LLM + {embedding_model}")
         except ImportError:
@@ -408,6 +412,34 @@ class Mem0Memory(MemoryStrategy):
         self._session_buffer[session_idx].append(
             {"role": role, "content": prefix + content}
         )
+
+    def _patch_mem0_llm(self):
+        """Patch Mem0's internal LLM to use reasoning_split=True and higher max_tokens."""
+        import re as _re
+        try:
+            llm = self.mem.llm
+            original_generate = llm.generate_response
+
+            def patched_generate(messages, response_format=None, tools=None, tool_choice="auto", **kwargs):
+                # Inject reasoning_split and bump max_tokens
+                kwargs["extra_body"] = {"reasoning_split": True}
+                kwargs["max_tokens"] = 4096
+                result = original_generate(
+                    messages=messages,
+                    response_format=response_format,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    **kwargs,
+                )
+                # Strip any residual <think> tags (safety net)
+                if isinstance(result, str):
+                    result = _re.sub(r"<think>.*?</think>", "", result, flags=_re.DOTALL).strip()
+                return result
+
+            llm.generate_response = patched_generate
+            print("[Mem0Memory] LLM patched: reasoning_split=True, max_tokens=4096")
+        except Exception as e:
+            print(f"[Mem0Memory] LLM patch failed: {e}")
 
     def flush(self):
         """replay 结束后调用：按 session 批量 add，每个 session 一次 LLM 调用提取 facts"""

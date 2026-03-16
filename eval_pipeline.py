@@ -424,16 +424,24 @@ class Mem0Memory(MemoryStrategy):
                 # Inject reasoning_split and bump max_tokens
                 kwargs["extra_body"] = {"reasoning_split": True}
                 kwargs["max_tokens"] = 4096
-                result = original_generate(
-                    messages=messages,
-                    response_format=response_format,
-                    tools=tools,
-                    tool_choice=tool_choice,
-                    **kwargs,
-                )
-                # Strip any residual <think> tags (safety net)
-                if isinstance(result, str):
-                    result = _re.sub(r"<think>.*?</think>", "", result, flags=_re.DOTALL).strip()
+                # Retry up to 3 times on empty response (MiniMax API occasional empty returns)
+                for attempt in range(3):
+                    result = original_generate(
+                        messages=messages,
+                        response_format=response_format,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        **kwargs,
+                    )
+                    # Strip any residual <think> tags (safety net)
+                    if isinstance(result, str):
+                        result = _re.sub(r"<think>.*?</think>", "", result, flags=_re.DOTALL).strip()
+                    if result and result.strip():
+                        return result
+                    print(f"[Mem0Memory] empty response from LLM (attempt {attempt+1}/3), msg count={len(messages)}")
+                    import time as _time
+                    _time.sleep(2)
+                print(f"[Mem0Memory] WARNING: all 3 attempts returned empty, msg count={len(messages)}")
                 return result
 
             llm.generate_response = patched_generate

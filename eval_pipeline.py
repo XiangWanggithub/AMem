@@ -352,8 +352,8 @@ class Mem0Memory(MemoryStrategy):
                     "provider": "openai",
                     "config": {
                         "model": "MiniMax-M2.5",
-                        "openai_api_key": os.environ.get("OPENAI_API_KEY", ""),
-                        "openai_api_base": os.environ.get("OPENAI_BASE_URL", ""),
+                        "api_key": os.environ.get("OPENAI_API_KEY", ""),
+                        "openai_base_url": os.environ.get("OPENAI_BASE_URL", ""),
                     }
                 },
                 "embedder": {

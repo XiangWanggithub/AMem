@@ -365,8 +365,9 @@ class Mem0Memory(MemoryStrategy):
                 "vector_store": {
                     "provider": "qdrant",
                     "config": {
-                        "collection_name": "mem0_eval",
+                        "collection_name": "mem0_eval_bge1024",
                         "on_disk": False,
+                        "embedding_model_dims": 1024,
                     }
                 }
             }

@@ -155,7 +155,7 @@ class MemoryStrategy(ABC):
         ...
 
     @abstractmethod
-    def retrieve(self, query: str) -> str:
+    def retrieve(self, query: str, client=None) -> str:
         """根据 query 检索相关记忆，返回拼入 prompt 的字符串"""
         ...
 
@@ -178,7 +178,7 @@ class NoMemory(MemoryStrategy):
 
     def observe(self, speaker: str, text: str, session_date: str = "", session_idx: int = -1, blip_caption: str = ""): pass
 
-    def retrieve(self, query: str) -> str:
+    def retrieve(self, query: str, client=None) -> str:
         return ""  # 完全没有上下文
 
 # ─────────────────────────────────────────────
@@ -210,7 +210,7 @@ class FullHistory(MemoryStrategy):
             entry += f" and shared {blip_caption}"
         self.history.append(entry)
 
-    def retrieve(self, query: str) -> str:
+    def retrieve(self, query: str, client=None) -> str:
         full = "\n".join(self.history)
         return full
 
@@ -220,46 +220,100 @@ class FullHistory(MemoryStrategy):
 
 class RAGMemory(MemoryStrategy):
     """
-    向量检索记忆。
+    向量检索记忆 - session 级别 chunk + query 改写。
+    改进：
+    - chunk 粒度从单条 turn 改为 session 级别，语义更完整，temporal 题受益
+    - 检索前用 LLM 将问题改写为更贴近对话内容的陈述句，提升召回
+    - top_k 默认 3（session 级别粒度大，3 个 session 已足够）
     依赖: pip install sentence-transformers numpy
-    默认使用本地 bge-large-en-v1.5 模型。
     """
 
-    def __init__(self, top_k: int = 5, embedding_model: str = "/home/models/bge-large-en-v1.5"):
+    def __init__(self, top_k: int = 3, embedding_model: str = "/home/models/bge-large-en-v1.5"):
         self.top_k = top_k
+        # session_idx -> list of turn strings
+        self._session_turns: dict[int, list[str]] = {}
+        self._session_dates: dict[int, str] = {}
+        # 最终 chunks（reset 时清空）
         self.chunks: list[str] = []
         self.embeddings: list = []
+        self._chunks_built = False
         try:
             from sentence_transformers import SentenceTransformer
             self._st_model = SentenceTransformer(embedding_model)
-            print(f"[RAGMemory] 加载 embedding 模型: {embedding_model}")
+            print(f"[RAGMemory] loaded embedding model: {embedding_model}")
         except ImportError:
-            raise ImportError("请先安装: pip install sentence-transformers")
+            raise ImportError("pip install sentence-transformers")
 
     @property
-    def name(self): return f"rag_top{self.top_k}"
+    def name(self): return f"rag_session_top{self.top_k}"
 
     def reset(self):
+        self._session_turns = {}
+        self._session_dates = {}
         self.chunks = []
         self.embeddings = []
+        self._chunks_built = False
 
     def _embed(self, text: str):
         return self._st_model.encode(text, normalize_embeddings=True).tolist()
 
+    def _build_chunks(self):
+        """把 session_turns 整合成 session 级别 chunk 并做 embedding（只在第一次 retrieve 时触发）"""
+        import numpy as np
+        self.chunks = []
+        self.embeddings = []
+        for idx in sorted(self._session_turns.keys()):
+            date = self._session_dates.get(idx, "")
+            turns = self._session_turns[idx]
+            header = f"[{date}]" if date else f"[Session {idx}]"
+            chunk = header + "\n" + "\n".join(turns)
+            self.chunks.append(chunk)
+            self.embeddings.append(self._embed(chunk))
+        self._chunks_built = True
+
     def observe(self, speaker: str, text: str, session_date: str = "", session_idx: int = -1, blip_caption: str = ""):
-        # 对齐 LoCoMo 官方 dialog 格式：日期前缀 + speaker said, "text" [and shared <blip>]
+        # 按 session 分组收集 turn
+        if session_idx not in self._session_turns:
+            self._session_turns[session_idx] = []
+            self._session_dates[session_idx] = session_date
         entry = f'{speaker} said, "{text}"'
         if blip_caption:
             entry += f" and shared {blip_caption}"
-        chunk = f"{session_date}: {entry}" if session_date else entry
-        self.chunks.append(chunk)
-        self.embeddings.append(self._embed(chunk))
+        self._session_turns[session_idx].append(entry)
+        self._chunks_built = False  # 有新数据，需要重新 build
 
-    def retrieve(self, query: str) -> str:
-        if not self.chunks:
+    def _rewrite_query(self, query: str, client) -> str:
+        """用 LLM 把问题改写成更贴近对话内容的陈述句，提升 embedding 检索召回"""
+        prompt = (
+            "Rewrite the following question as a short declarative statement that "
+            "describes what information to look for in a conversation. "
+            "Output only the rewritten statement, no explanation.\n\n"
+            f"Question: {query}\nStatement:"
+        )
+        try:
+            resp = client.chat.completions.create(
+                model="MiniMax-M2.5",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=128,
+                temperature=0,
+            )
+            raw = resp.choices[0].message.content.strip()
+            import re as _re
+            # 剥离 think 标签
+            cleaned = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL).strip()
+            return cleaned if cleaned else query
+        except Exception:
+            return query
+
+    def retrieve(self, query: str, client=None) -> str:
+        if not self._session_turns:
             return ""
+        if not self._chunks_built:
+            self._build_chunks()
         import numpy as np
-        q_emb = np.array(self._embed(query))
+        # query 改写
+        search_query = self._rewrite_query(query, client) if client else query
+        q_emb = np.array(self._embed(search_query))
         scores = [
             np.dot(q_emb, np.array(e)) /
             (np.linalg.norm(q_emb) * np.linalg.norm(np.array(e)) + 1e-9)
@@ -267,7 +321,7 @@ class RAGMemory(MemoryStrategy):
         ]
         top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:self.top_k]
         top_idx_sorted = sorted(top_idx)  # 按时间顺序返回
-        return "\n".join(self.chunks[i] for i in top_idx_sorted)
+        return "\n\n".join(self.chunks[i] for i in top_idx_sorted)
 
 # ─────────────────────────────────────────────
 # Baseline D: Mem0Memory
@@ -310,7 +364,7 @@ class Mem0Memory(MemoryStrategy):
             user_id=self.user_id,
         )
 
-    def retrieve(self, query: str) -> str:
+    def retrieve(self, query: str, client=None) -> str:
         if not self.available:
             return ""
         results = self.mem.search(query=query, user_id=self.user_id, limit=5)
@@ -344,7 +398,11 @@ class AgentLoop:
 
     def answer(self, question: str) -> tuple[str, float, int]:
         """回答一个 probe 问题，返回 (answer, latency_ms, tokens)"""
-        context = self.memory.retrieve(question)
+        # RAGMemory supports client param for query rewriting; others ignore it
+        if hasattr(self.memory, "_rewrite_query"):
+            context = self.memory.retrieve(question, client=self.client)
+        else:
+            context = self.memory.retrieve(question)
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         if context:
             messages.append({

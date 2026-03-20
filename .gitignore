@@ -18,3 +18,17 @@ __pycache__/
 *.bin
 *.pt
 *.safetensors
+
+# 临时日志
+embedding_server.log
+memos_eval.log
+logs/
+
+# Third-party repos
+MemOS/
+
+# IDE / tool configs
+.claude/
+
+# Local data
+qdrant_storage/

@@ -328,6 +328,55 @@ class RAGMemory(MemoryStrategy):
 # Baseline D: Mem0Memory
 # ─────────────────────────────────────────────
 
+
+CUSTOM_EXTRACTION_PROMPT = f"""You are a Personal Information Organizer, specialized in accurately storing facts, user memories, and preferences. Your primary role is to extract relevant pieces of information from conversations and organize them into distinct, manageable facts. This allows for easy retrieval and personalization in future interactions. Below are the types of information you need to focus on and the detailed instructions on how to handle the input data.
+
+Types of Information to Remember:
+
+1. Store Personal Preferences: Keep track of likes, dislikes, and specific preferences in various categories such as food, products, activities, and entertainment.
+2. Maintain Important Personal Details: Remember significant personal information like names, relationships, and important dates.
+3. Track Plans and Intentions: Note upcoming events, trips, goals, and any plans the user has shared.
+4. Remember Activity and Service Preferences: Recall preferences for dining, travel, hobbies, and other services.
+5. Monitor Health and Wellness Preferences: Keep a record of dietary restrictions, fitness routines, and other wellness-related information.
+6. Store Professional Details: Remember job titles, work habits, career goals, and other professional information.
+7. Miscellaneous Information Management: Keep track of favorite books, movies, brands, and other miscellaneous details that the user shares.
+
+CRITICAL RULES:
+- Each fact MUST include the person's name as the subject. Do NOT use "user" or "the person". Use their actual name (e.g., "Caroline", "Melanie").
+- When timestamps like [1:56 pm on 8 May, 2023] appear in messages, use them to resolve relative dates. For example, "yesterday" on May 8 means May 7.
+- Include specific dates in facts whenever possible.
+
+Here are some few shot examples:
+
+Input: [8 May, 2023] Caroline: Hi, how are you?
+Output: {{{{"facts" : []}}}}
+
+Input: [8 May, 2023] Caroline: I went to a LGBTQ support group yesterday and it was so powerful.
+Output: {{{{"facts" : ["Caroline went to a LGBTQ support group on May 7, 2023 and found it powerful"]}}}}
+
+Input: [8 May, 2023] Melanie: I started my new painting class last week.
+Output: {{{{"facts" : ["Melanie started a new painting class around May 1, 2023"]}}}}
+
+Input: [15 June, 2023] Caroline: My name is Caroline and I work as a teacher.
+Output: {{{{"facts" : ["Caroline's name is Caroline", "Caroline works as a teacher"]}}}}
+
+Input: [15 June, 2023] Melanie: I love hiking and my favourite movie is Inception.
+Output: {{{{"facts" : ["Melanie loves hiking", "Melanie's favourite movie is Inception"]}}}}
+
+Return the facts and preferences in a json format as shown above.
+
+Remember the following:
+- Today's date is {{datetime.now().strftime("%Y-%m-%d")}}.
+- Do not return anything from the custom few shot example prompts provided above.
+- If you do not find anything relevant in the below conversation, you can return an empty list corresponding to the "facts" key.
+- Create the facts based on the user and assistant messages only. Do not pick anything from the system messages.
+- Make sure to return the response in the format mentioned in the examples. The response should be in json with a key as "facts" and corresponding value will be a list of strings.
+- ALWAYS include the person's name in each fact. Never use generic terms like "user" or "the person".
+- ALWAYS resolve relative dates (yesterday, last week, etc.) to absolute dates using the timestamp prefix.
+
+Following is a conversation between the user and the assistant. You have to extract the relevant facts and preferences from the conversation and return them in the json format as shown above.
+"""
+
 class Mem0Memory(MemoryStrategy):
     """
     Mem0 记忆系统 - 本地模式（MiniMax LLM + bge embedder）。
@@ -366,10 +415,12 @@ class Mem0Memory(MemoryStrategy):
                     "provider": "qdrant",
                     "config": {
                         "collection_name": "mem0_eval_bge1024",
-                        "on_disk": True,
+                        "path": "/home/w00857628/memory-eval/qdrant_storage",
+                        "on_disk": False,
                         "embedding_model_dims": 1024,
                     }
-                }
+                },
+                "custom_fact_extraction_prompt": CUSTOM_EXTRACTION_PROMPT,
             }
             self.mem = Memory.from_config(config)
             # Monkey-patch LLM generate_response to:
@@ -399,18 +450,29 @@ class Mem0Memory(MemoryStrategy):
             pass
 
     def observe(self, speaker: str, text: str, session_date: str = "", session_idx: int = -1, blip_caption: str = ""):
-        # 只收集 turns，不调 LLM；replay 结束后调 flush() 批量处理
+        # 按官方方式：content 加人名前缀，存 session_date
         if not self.available:
             return
         content = text
         if blip_caption:
             content += f" [shared image: {blip_caption}]"
-        prefix = f"[{session_date}] " if session_date else ""
-        role = "assistant" if speaker == "agent" else "user"
+        # 格式："[session_date] {speaker_name}: {text}"
+        if session_date:
+            content = f"[{session_date}] {speaker}: {content}"
+        else:
+            content = f"{speaker}: {content}"
+        # 确定 role：speaker_a -> user, speaker_b -> assistant
         if session_idx not in self._session_buffer:
-            self._session_buffer[session_idx] = []
-        self._session_buffer[session_idx].append(
-            {"role": role, "content": prefix + content}
+            self._session_buffer[session_idx] = {"messages": [], "date": session_date, "speakers": set()}
+        self._session_buffer[session_idx]["speakers"].add(speaker)
+        speakers = sorted(self._session_buffer[session_idx]["speakers"])
+        # 第一个出现的 speaker 是 user，第二个是 assistant
+        if len(speakers) <= 1 or speaker == speakers[0]:
+            role = "user"
+        else:
+            role = "assistant"
+        self._session_buffer[session_idx]["messages"].append(
+            {"role": role, "content": content}
         )
 
     def _patch_mem0_llm(self):
@@ -423,7 +485,7 @@ class Mem0Memory(MemoryStrategy):
             def patched_generate(messages, response_format=None, tools=None, tool_choice="auto", **kwargs):
                 # Inject reasoning_split and bump max_tokens
                 kwargs["extra_body"] = {"reasoning_split": True}
-                kwargs["max_tokens"] = 8192
+                kwargs["max_tokens"] = 128000
                 # Retry up to 3 times on empty response (MiniMax API occasional empty returns)
                 for attempt in range(3):
                     result = original_generate(
@@ -450,24 +512,52 @@ class Mem0Memory(MemoryStrategy):
             print(f"[Mem0Memory] LLM patch failed: {e}")
 
     def flush(self):
-        """replay 结束后调用：按 session 批量 add，每个 session 一次 LLM 调用提取 facts"""
+        """按官方方式：batch_size=2, 带 timestamp metadata"""
         if not self.available or not self._session_buffer:
             return
-        total = len(self._session_buffer)
+        total_sessions = len(self._session_buffer)
+        batch_size = 2
+        total_batches = 0
+        total_facts = 0
         for i, idx in enumerate(sorted(self._session_buffer.keys())):
-            messages = self._session_buffer[idx]
-            try:
-                self.mem.add(messages=messages, user_id=self.user_id)
-                print(f"[Mem0Memory] flush session {i+1}/{total} (idx={idx}, turns={len(messages)})")
-            except Exception as e:
-                print(f"[Mem0Memory] flush session {idx} error: {e}")
+            buf = self._session_buffer[idx]
+            messages = buf["messages"]
+            session_date = buf["date"]
+            session_turns = len(messages)
+            added_count = 0
+            # 按 batch_size=2 分批 add（官方方式）
+            for j in range(0, session_turns, batch_size):
+                batch = messages[j:j+batch_size]
+                try:
+                    import time as _t0
+                    _t1 = _t0.time()
+                    result = self.mem.add(
+                        messages=batch,
+                        user_id=self.user_id,
+                        metadata={"timestamp": session_date} if session_date else None,
+                    )
+                    _elapsed = _t0.time() - _t1
+                    n_res = len(result.get("results", []) if isinstance(result, dict) else result)
+                    print(f"[Mem0Memory] session {i+1}/{total_sessions} batch {j//batch_size+1}: {n_res} facts, {_elapsed:.1f}s")
+                    added_count += n_res
+                except Exception as e:
+                    print(f"[Mem0Memory] session {i+1} batch {j//batch_size+1} error: {e}")
+                total_batches += 1
+            total_facts += added_count
+            print(f"[Mem0Memory] flush session {i+1}/{total_sessions} (idx={idx}, turns={session_turns}): {added_count} facts extracted")
         self._session_buffer = {}
+        print(f"[Mem0Memory] flush complete: {total_batches} batches, {total_facts} facts across {total_sessions} sessions")
 
     def retrieve(self, query: str, client=None) -> str:
         if not self.available:
             return ""
         try:
             results = self.mem.search(query=query, user_id=self.user_id, limit=5)
+            results_list = results.get('results', []) if isinstance(results, dict) else results
+            print(f"[Mem0Memory] search for '{query[:30]}...': {len(results_list)} results")
+            for i, r in enumerate(results_list):
+                mem_text = r.get('memory', r.get('text', str(r)))[:150]
+                print(f"[Mem0Memory]   result {i}: {mem_text}")
         except Exception as e:
             print(f"[Mem0Memory] search error: {e}")
             return ""
@@ -494,11 +584,12 @@ class AgentLoop:
         self.client = OpenAI()
         self.total_tokens = 0
 
-    def replay_conversation(self, turns: list[Turn]):
+    def replay_conversation(self, turns: list[Turn], max_sessions: int = 9999):
         """重放对话历史，让 memory 系统学习"""
         self.memory.reset()
         for turn in turns:
-            self.memory.observe(turn.speaker, turn.text, turn.session_date, turn.session_idx, turn.blip_caption)
+            if turn.session_idx < max_sessions:
+                self.memory.observe(turn.speaker, turn.text, turn.session_date, turn.session_idx, turn.blip_caption)
         # Mem0Memory: observe only collects turns, flush() batch-adds after replay
         if hasattr(self.memory, "flush"):
             self.memory.flush()
@@ -659,6 +750,7 @@ def run_eval(
     judge_model: str = "MiniMax-M2.5",
     max_qa_per_conv: int = 20,
     categories: Optional[list[str]] = None,
+    max_sessions: int = 9999,
 ) -> list[EvalResult]:
 
     judge = LLMJudge(model=judge_model)
@@ -674,7 +766,7 @@ def run_eval(
             print(f"\n  对话: {conv.sample_id}（{len(conv.turns)} 轮, {len(conv.qa_list)} 个 QA）")
 
             # 重放对话历史
-            agent.replay_conversation(conv.turns)
+            agent.replay_conversation(conv.turns, max_sessions=max_sessions)
 
             # 筛选要测的 QA
             qa_subset = conv.qa_list
@@ -774,12 +866,201 @@ def save_results(results: list[EvalResult], output_path: str):
 # CLI 入口
 # ─────────────────────────────────────────────
 
+# Baseline E: MemOS (MemTensor/MemOS self-hosted)
+# ─────────────────────────────────────────────
+
+class MemOSStrategy(MemoryStrategy):
+    """
+    MemTensor/MemOS self-hosted adapter for eval_pipeline.
+    
+    API base: http://localhost:18001
+    Requires: Neo4j (graph memory) + Qdrant (vector search) + embedding server (port 8002)
+    LLM: MiniMax M2.5 (via .env OPENAI_BASE_URL)
+    Embedding: bge-large-en-v1.5 (via local embedding server)
+    """
+
+    def __init__(self, user_id: str = "eval_user", api_base: str = "http://localhost:18001"):
+        self.user_id = user_id
+        self.api_base = api_base
+        self._session_buffer: dict[int, list] = {}
+        self.available = False
+        self._checked = False
+
+    def _ensure_available(self):
+        if self._checked:
+            return
+        self._checked = True
+        try:
+            import requests
+            # MemOS 没有 /health，用 /docs 检查服务是否可达
+            r = requests.get(f"{self.api_base}/docs", timeout=5)
+            if r.status_code == 200:
+                self.available = True
+                print(f"[MemOSStrategy] connected to {self.api_base}")
+            else:
+                print(f"[MemOSStrategy] service check failed: {r.status_code}")
+        except Exception as e:
+            print(f"[MemOSStrategy] unavailable: {e}")
+
+    @property
+    def name(self):
+        return "memos"
+
+    def reset(self):
+        self._ensure_available()
+        if not self.available:
+            return
+        # 换新 user_id + 删除旧 user 数据，实现跨对话隔离
+        old_uid = self.user_id
+        self._session_buffer = {}
+        try:
+            import requests
+            # Use clear_user endpoint to properly clean Neo4j + Qdrant
+            resp = requests.post(
+                f"{self.api_base}/product/clear_user",
+                json={"user_name": old_uid},
+                timeout=30
+            )
+            if resp.status_code == 200:
+                print(f"[MemOSStrategy] reset: cleared all data for {old_uid}, now using {self.user_id}")
+            else:
+                print(f"[MemOSStrategy] reset: clear_user returned {resp.status_code} - manual cleanup may be needed")
+        except Exception as e:
+            print(f"[MemOSStrategy] reset delete error: {e}")
+
+    def observe(self, speaker: str, text: str, session_date: str = "", session_idx: int = -1, blip_caption: str = ""):
+        if not self.available:
+            self._ensure_available()
+        if not self.available:
+            return
+        content = text
+        if blip_caption:
+            content += f" [shared image: {blip_caption}]"
+        if session_date:
+            content = f"[{session_date}] {speaker}: {content}"
+        else:
+            content = f"{speaker}: {content}"
+        if session_idx not in self._session_buffer:
+            self._session_buffer[session_idx] = {"messages": [], "date": session_date}
+        self._session_buffer[session_idx]["messages"].append(content)
+
+    def flush(self):
+        """批量添加：将每个 session 的 messages 作为 conversation 添加到 MemOS"""
+        if not self.available or not self._session_buffer:
+            return
+        import requests
+        total_sessions = len(self._session_buffer)
+        total_added = 0
+        for i, idx in enumerate(sorted(self._session_buffer.keys())):
+            buf = self._session_buffer[idx]
+            messages = buf["messages"]
+            if not messages:
+                continue
+            # MemOS add 需要 messages 格式：[{"role": "user"/"assistant", "content": ...}]
+            # 假设第一个出现的 speaker 是 user，其余是 assistant
+            api_messages = []
+            session_speakers = set()
+            for msg in messages:
+                # msg 格式: "[date] Speaker: content" 或 "Speaker: content"
+                # 提取 speaker name 用于判断 role，但 content 保留完整原文（含日期）
+                parts = msg.split(": ", 1)
+                speaker = parts[0].replace("[", "").replace("]", "").split()[-1] if ":" in msg else "user"
+                session_speakers.add(speaker)
+                sorted_speakers = sorted(session_speakers)
+                role = "user" if (len(sorted_speakers) <= 1 or speaker == sorted_speakers[0]) else "assistant"
+                # 保留完整 msg 作为 content，让 MemOS LLM 能看到日期
+                api_messages.append({"role": role, "content": msg})
+            max_retries = 3
+            for attempt in range(1, max_retries + 1):
+                try:
+                    t0 = time.time()
+                    resp = requests.post(
+                        f"{self.api_base}/product/add",
+                        json={
+                            "user_id": self.user_id,
+                            "messages": api_messages,
+                            "async_mode": "sync",
+                        },
+                        timeout=600,
+                    )
+                    elapsed = time.time() - t0
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        n_added = len(data.get("data", []))
+                        total_added += n_added
+                        print(f"[MemOSStrategy] session {i+1}/{total_sessions}: {n_added} memories, {elapsed:.1f}s")
+                        break  # success
+                    else:
+                        print(f"[MemOSStrategy] session {i+1} error (attempt {attempt}/{max_retries}): {resp.status_code} {resp.text[:100]}")
+                        if attempt < max_retries:
+                            time.sleep(5)
+                except Exception as e:
+                    print(f"[MemOSStrategy] session {i+1} add error (attempt {attempt}/{max_retries}): {e}")
+                    if attempt < max_retries:
+                        time.sleep(10)
+        self._session_buffer = {}
+        print(f"[MemOSStrategy] flush complete: {total_added} total memories across {total_sessions} sessions")
+
+        # Trigger reorganization (build tree structure) after all sessions are flushed
+        try:
+            print(f"[MemOSStrategy] triggering reorganization...")
+            t0 = time.time()
+            resp = requests.post(
+                f"{self.api_base}/product/reorganize",
+                json={"user_id": self.user_id, "scope": "all"},
+                timeout=600,  # reorganize can take a while with LLM calls
+            )
+            elapsed = time.time() - t0
+            if resp.status_code == 200:
+                print(f"[MemOSStrategy] reorganization completed in {elapsed:.1f}s: {resp.json()}")
+            else:
+                print(f"[MemOSStrategy] reorganization failed: {resp.status_code} {resp.text[:200]}")
+        except Exception as e:
+            print(f"[MemOSStrategy] reorganization error (non-fatal): {e}")
+
+    def retrieve(self, query: str, client=None) -> str:
+        if not self.available:
+            self._ensure_available()
+        if not self.available:
+            return ""
+        try:
+            import requests
+            resp = requests.post(
+                f"{self.api_base}/product/search",
+                json={
+                    "query": query,
+                    "user_id": self.user_id,
+                },
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                print(f"[MemOSStrategy] search error: {resp.status_code}")
+                return ""
+            data = resp.json()
+            memories = []
+            result_data = data.get("data", {})
+            # 收集所有类型的 memory text
+            for key in ["text_mem", "act_mem", "para_mem", "pref_mem"]:
+                for cube_data in result_data.get(key, []):
+                    for mem in cube_data.get("memories", []):
+                        text = mem.get("memory", "")
+                        if text:
+                            memories.append(text)
+            n_results = len(memories)
+            print(f"[MemOSStrategy] search for '{query[:40]}': {n_results} results")
+            for i, m in enumerate(memories[:5]):
+                print(f"[MemOSStrategy]   [{i}]: {m[:120]}")
+            return "\n\n".join(memories)
+        except Exception as e:
+            print(f"[MemOSStrategy] retrieve error: {e}")
+            return ""
+
 def main():
     parser = argparse.ArgumentParser(description="Memory Eval Pipeline")
     parser.add_argument("--data", required=True, help="LoCoMo 数据路径 (locomo10.json)")
     parser.add_argument(
         "--strategy", default="all",
-        choices=["all", "no_memory", "full_history", "rag", "mem0"],
+        choices=["all", "no_memory", "full_history", "rag", "mem0", "memos"],
         help="要评测的 memory 策略"
     )
     parser.add_argument("--model", default="MiniMax-M2.5", help="答题模型")
@@ -788,6 +1069,8 @@ def main():
     parser.add_argument("--embedding-model", default="/home/models/bge-large-en-v1.5",
                         help="RAG 使用的 embedding 模型路径或 HuggingFace 模型名")
     parser.add_argument("--max-qa", type=int, default=20, help="每条对话最多测几个 QA")
+    parser.add_argument("--max-sessions", type=int, default=9999, help="Mem0: 最多 flush 多少个 session（调试用）")
+    
     parser.add_argument("--categories", nargs="*", help="只测指定类别 (single-hop temporal multi-hop open-domain)")
     parser.add_argument("--conv-ids", nargs="*", default=None,
                         help="只跑指定对话 ID，例如: --conv-ids conv-26 conv-30（不传则跑全部）")
@@ -805,6 +1088,7 @@ def main():
         if name == "full_history": return FullHistory()
         if name == "rag":         return RAGMemory(top_k=args.top_k, embedding_model=args.embedding_model)
         if name == "mem0":        return Mem0Memory()
+        if name == "memos":       return MemOSStrategy()
         raise ValueError(f"未知策略: {name}")
 
     strategy_names = ["no_memory", "full_history", "rag", "mem0"] if args.strategy == "all" else [args.strategy]
@@ -827,6 +1111,7 @@ def main():
         judge_model=args.judge_model,
         max_qa_per_conv=args.max_qa,
         categories=args.categories,
+        max_sessions=args.max_sessions,
     )
 
     # 汇总 & 保存
@@ -835,3 +1120,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ─────────────────────────────────────────────

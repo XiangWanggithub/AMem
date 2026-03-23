@@ -1,3 +1,33 @@
+
+# ─────────────────────────────────────────────
+# Retry decorator for rate limit errors
+# ─────────────────────────────────────────────
+
+def retry_on_rate_limit(max_retries=3, delays=None):
+    """Retry decorator for rate limit errors (429). delays=[10,20,30] for fixed schedule."""
+    from functools import wraps
+    import time
+    if delays is None:
+        delays = [10, 20, 30]
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    error_str = str(e)
+                    if "429" in error_str or "rate_limit" in error_str.lower():
+                        if attempt < max_retries:
+                            wait = delays[attempt] if attempt < len(delays) else delays[-1]
+                            print(f"[retry] Rate limit hit, retry {attempt+1}/{max_retries} after {wait}s")
+                            time.sleep(wait)
+                            continue
+                    raise
+            return None
+        return wrapper
+    return decorator
+
 """
 Memory Eval Pipeline
 ====================
@@ -578,10 +608,17 @@ If the answer is not found in the memory, say "I don't know" honestly. Do not ma
 Answer concisely in plain natural language. Do not output anything extra."""
 
 class AgentLoop:
-    def __init__(self, memory: MemoryStrategy, model: str = "MiniMax-M2.5"):
+    def __init__(self, memory: MemoryStrategy, model: str = "MiniMax-M2.5",
+                 answer_base_url: str = "", answer_api_key: str = ""):
         self.memory = memory
         self.model = model
-        self.client = OpenAI()
+        # If separate answer model API provided, create dedicated client
+        if answer_base_url and answer_api_key:
+            self.client = OpenAI(base_url=answer_base_url, api_key=answer_api_key)
+            self._is_glm = "glm" in model.lower()
+        else:
+            self.client = OpenAI()
+            self._is_glm = False
         self.total_tokens = 0
 
     def replay_conversation(self, turns: list[Turn], max_sessions: int = 9999):
@@ -611,13 +648,20 @@ class AgentLoop:
             messages.append({"role": "user", "content": f"[Question]\n{question}"})
 
         t0 = time.time()
-        resp = self.client.chat.completions.create(
+        create_kwargs = dict(
             model=self.model,
             messages=messages,
             temperature=0,
-            max_tokens=1024,  # enough for answer + think
+            max_tokens=1024,
             timeout=60,
         )
+        if self._is_glm:
+            # Disable thinking mode for GLM-4.7
+            create_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        @retry_on_rate_limit(max_retries=3, initial_delay=2.0)
+        def _call_llm():
+            return self.client.chat.completions.create(**create_kwargs)
+        resp = _call_llm()
         latency_ms = (time.time() - t0) * 1000
         tokens = resp.usage.total_tokens
         self.total_tokens += tokens
@@ -751,6 +795,8 @@ def run_eval(
     max_qa_per_conv: int = 20,
     categories: Optional[list[str]] = None,
     max_sessions: int = 9999,
+    answer_base_url: str = "",
+    answer_api_key: str = "",
 ) -> list[EvalResult]:
 
     judge = LLMJudge(model=judge_model)
@@ -760,7 +806,7 @@ def run_eval(
         print(f"\n{'='*50}")
         print(f"策略: {strategy.name}")
         print(f"{'='*50}")
-        agent = AgentLoop(memory=strategy, model=model)
+        agent = AgentLoop(memory=strategy, model=model, answer_base_url=answer_base_url, answer_api_key=answer_api_key)
 
         for conv in conversations:
             print(f"\n  对话: {conv.sample_id}（{len(conv.turns)} 轮, {len(conv.qa_list)} 个 QA）")
@@ -1055,15 +1101,171 @@ class MemOSStrategy(MemoryStrategy):
             print(f"[MemOSStrategy] retrieve error: {e}")
             return ""
 
+
+
+class OpenVikingStrategy(MemoryStrategy):
+    """
+    OpenViking (ByteDance/Volcengine) adapter for eval_pipeline.
+    
+    Uses local embedding server (bge-large-en-v1.5, port 8002)
+    and MiniMax M2.5 as VLM for memory extraction.
+    
+    Storage: ~/memory-eval/openviking_workspace
+    """
+
+    def __init__(self, user_id: str = "eval_user", workspace: str = "",
+                 embedding_api_base: str = "http://localhost:8002/v1",
+                 vlm_api_base: str = "https://api.minimaxi.com/v1",
+                 vlm_api_key: str = "", vlm_model: str = "MiniMax-M2.5"):
+        self.user_id = user_id
+        self.ov_module = None  # lazy import
+        self.workspace = workspace or "/home/w00857628/memory-eval/openviking_workspace"
+        self.embedding_api_base = embedding_api_base
+        self.vlm_api_base = vlm_api_base
+        self.vlm_api_key = vlm_api_key
+        self.vlm_model = vlm_model
+        self._client = None
+        self._session = None
+        self._conv_id = ""
+        self._available = False
+        self._checked = False
+
+    def _ensure_client(self):
+        if self._client is not None:
+            return
+        import os
+        cfg = os.path.join("/home/w00857628", ".openviking", "ov.conf")
+        if os.path.exists(cfg):
+            os.environ.setdefault("OPENVIKING_CONFIG_FILE", cfg)
+        from openviking import OpenViking
+        self._client = OpenViking(path=self.workspace)
+        self._client.initialize()
+        self._available = True
+        print(f"[OpenVikingStrategy] initialized client at {self.workspace}")
+
+    @property
+    def name(self):
+        return "openviking"
+
+    def reset(self):
+        import os, shutil, asyncio
+        # 1. Close client + destroy singleton
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+            try:
+                from openviking.async_client import AsyncOpenViking as _AOV
+                loop = asyncio.new_event_loop()
+                loop.run_until_complete(_AOV.reset())
+                loop.close()
+            except Exception as e:
+                print(f"[OpenVikingStrategy] singleton reset warning: {e}")
+            self._client = None
+            self._available = False
+        # 2. Wipe workspace directory
+        if os.path.exists(self.workspace):
+            shutil.rmtree(self.workspace)
+            print(f"[OpenVikingStrategy] deleted workspace: {self.workspace}")
+        # 3. Reinitialize
+        self._session = None
+        self._conv_id = ""
+        self._ensure_client()
+        print(f"[OpenVikingStrategy] reset complete (fresh workspace)")
+
+    def observe(self, speaker: str, text: str, session_date: str = "", session_idx: int = -1, blip_caption: str = ""):
+        from openviking.message.part import TextPart
+        if not self._available:
+            self._ensure_client()
+        if not self._available:
+            return
+        conv_id = f"conv_{session_idx}"
+        if self._conv_id != conv_id:
+            if self._session is not None:
+                try:
+                    self._session.commit()
+                    print(f"[OpenVikingStrategy] committed previous session {self._conv_id}")
+                except Exception as e:
+                    print(f"[OpenVikingStrategy] commit on session switch: {e}")
+            self._conv_id = conv_id
+            self._session = self._client.session(session_id=conv_id)
+        content = text
+        if blip_caption:
+            content += f" [shared image: {blip_caption}]"
+        if session_date:
+            content = f"[{session_date}] {speaker}: {content}"
+        else:
+            content = f"{speaker}: {content}"
+        role = "user" if speaker.lower() in ("user", "human", "me") else "assistant"
+        self._session.add_message(role, [TextPart(text=content)])
+
+    def flush(self):
+        if not self._available or self._session is None:
+            return
+        import time
+        t0 = time.time()
+        try:
+            result = self._session.commit()
+            elapsed = time.time() - t0
+            memories = result.get("memories_extracted", 0)
+            print(f"[OpenVikingStrategy] committed: {memories} memories extracted in {elapsed:.1f}s")
+        except Exception as e:
+            print(f"[OpenVikingStrategy] flush/commit error: {e}")
+
+    def retrieve(self, query: str, client=None) -> str:
+        if not self._available:
+            self._ensure_client()
+        if not self._available:
+            return ""
+        try:
+            result = self._client.find(query, limit=10)
+            memories = []
+            for match in result.memories[:5]:
+                content = ""
+                uri = match.uri or ""
+                # L2 full text > L1 overview > L0 abstract
+                if uri:
+                    try:
+                        content = self._client.read(uri) or ""
+                    except Exception:
+                        pass
+                    if not content:
+                        try:
+                            content = self._client.overview(uri) or ""
+                        except Exception:
+                            pass
+                if not content:
+                    content = match.abstract or ""
+                    if not content and uri:
+                        try:
+                            content = self._client.abstract(uri) or ""
+                        except Exception:
+                            pass
+                if content:
+                    memories.append(content)
+            n = len(memories)
+            print(f"[OpenVikingStrategy] find: {n} memory results for query: {query[:40]}")
+            for i, m in enumerate(memories[:3]):
+                level = "L2" if len(m) > 500 else ("L1" if len(m) > 150 else "L0")
+                print(f"[OpenVikingStrategy]   [{i}] ({level}, {len(m)}ch): {m[:100]}")
+            return "\n\n".join(memories)
+        except Exception as e:
+            print(f"[OpenVikingStrategy] retrieve error: {e}")
+            return ""
+
+
 def main():
     parser = argparse.ArgumentParser(description="Memory Eval Pipeline")
     parser.add_argument("--data", required=True, help="LoCoMo 数据路径 (locomo10.json)")
     parser.add_argument(
         "--strategy", default="all",
-        choices=["all", "no_memory", "full_history", "rag", "mem0", "memos"],
+        choices=["all", "no_memory", "full_history", "rag", "mem0", "memos", "openviking"],
         help="要评测的 memory 策略"
     )
     parser.add_argument("--model", default="MiniMax-M2.5", help="答题模型")
+    parser.add_argument("--answer-base-url", default="", help="答题模型的 API base URL（不填则用 OPENAI_BASE_URL）")
+    parser.add_argument("--answer-api-key", default="", help="答题模型的 API key（不填则用 OPENAI_API_KEY）")
     parser.add_argument("--judge-model", default="MiniMax-M2.5", help="评分模型")
     parser.add_argument("--top-k", type=int, default=5, help="RAG 检索 top-k")
     parser.add_argument("--embedding-model", default="/home/models/bge-large-en-v1.5",
@@ -1089,6 +1291,7 @@ def main():
         if name == "rag":         return RAGMemory(top_k=args.top_k, embedding_model=args.embedding_model)
         if name == "mem0":        return Mem0Memory()
         if name == "memos":       return MemOSStrategy()
+        if name == "openviking":  return OpenVikingStrategy()
         raise ValueError(f"未知策略: {name}")
 
     strategy_names = ["no_memory", "full_history", "rag", "mem0"] if args.strategy == "all" else [args.strategy]
@@ -1103,6 +1306,17 @@ def main():
             exit(1)
         print(f"过滤后：只跑 {[c.sample_id for c in conversations]}")
 
+    # Auto-detect GLM config from .env if --model contains "glm" and no explicit base_url
+    answer_base_url = args.answer_base_url
+    answer_api_key = args.answer_api_key
+    if "glm" in args.model.lower() and not answer_base_url:
+        answer_base_url = os.environ.get("GLM_BASE_URL", "")
+        answer_api_key = os.environ.get("GLM_API_KEY", "")
+        if answer_base_url and answer_api_key:
+            print(f"自动检测到 GLM 配置: base_url={answer_base_url}")
+        else:
+            print("警告: 模型名包含 'glm' 但未找到 GLM_BASE_URL/GLM_API_KEY 环境变量")
+
     # 运行评测
     results = run_eval(
         conversations=conversations,
@@ -1112,6 +1326,8 @@ def main():
         max_qa_per_conv=args.max_qa,
         categories=args.categories,
         max_sessions=args.max_sessions,
+        answer_base_url=answer_base_url,
+        answer_api_key=answer_api_key,
     )
 
     # 汇总 & 保存
@@ -1122,4 +1338,8 @@ if __name__ == "__main__":
     main()
 
 
+# ─────────────────────────────────────────────
+
+# ─────────────────────────────────────────────
+# OpenViking Memory Strategy
 # ─────────────────────────────────────────────

@@ -32,3 +32,6 @@ MemOS/
 
 # Local data
 qdrant_storage/
+
+# OpenViking workspace
+openviking_workspace/

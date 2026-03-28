@@ -42,7 +42,14 @@ These items should already contain at least:
 - global policy state
 
 ### Design decision
-In v0, `normalize_memory` should operate primarily on the memory item itself and its local evidence/context, rather than over the whole memory base.
+In v0, `normalize_memory` should operate primarily on the memory item itself together with its local evidence/context, rather than over the whole memory base.
+This is important because relative time expressions (e.g. `last June`) and local references often cannot be normalized reliably from isolated content alone.
+So normalization may depend on:
+- evidence
+- source turn information
+- local temporal context
+- local attribution context
+
 This keeps it distinct from `merge_memory` and `update_memory`.
 
 ---
@@ -191,6 +198,7 @@ These belong more naturally to:
 ### With `extract_memory`
 `extract_memory` may already perform first-pass normalization, especially for obvious time expressions.
 `normalize_memory` acts as a second-pass stabilizer and correctness layer.
+In particular, `normalize_memory` may rely on evidence and local temporal context to resolve expressions such as `last June`, `next year`, or local pronoun references.
 
 So the current view is:
 - `extract_memory` does lightweight first-pass cleanup

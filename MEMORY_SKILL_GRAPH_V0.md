@@ -18,9 +18,11 @@ It is intended to serve as:
 3. `normalize_memory`
 4. `retrieve_merge_candidates`
 5. `merge_memory`
-6. `update_memory`
+6. `retrieve_update_candidates`
+7. `update_memory`
+8. `score_memory`
 
-This is the current core path for turning new dialogue context into maintained memory objects.
+This is the current core maintenance path for turning new dialogue context into maintained memory objects.
 
 ---
 
@@ -215,15 +217,18 @@ Current notable decisions:
 ## 8. What is still missing from the v0 graph
 
 The current graph is already meaningful, but not yet complete.
-Likely next additions include:
+Recently added or newly specified extensions include:
 
-- `score_memory`
-- `link_memory`
 - `retrieve_update_candidates`
+- `score_memory`
+- `analyze_query`
+- `retrieve_answer_candidates`
+- `assemble_memory_context`
+- `link_memory`
 - `reorganize_memory`
-- `memory policy`
+- `memory_policy`
 
-These will likely expand the graph from a linear maintenance path into a more structured memory-management system.
+The graph is no longer just a maintenance-only path; it now includes early retrieve-side and organization-side structure.
 
 ---
 

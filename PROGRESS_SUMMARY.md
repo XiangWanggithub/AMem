@@ -2,7 +2,7 @@
 
 ## Current stage
 
-The project is currently at the end of the **maintenance-side v0 validation** stage.
+The project is currently at the end of the **maintenance-side v0 validation** stage and the beginning of the **retrieve-side / organization-side expansion** stage.
 
 This means:
 - the core memory skills have been decomposed and documented,
@@ -45,6 +45,11 @@ Completed specs:
 - `UPDATE_MEMORY_SPEC.md`
 - `SCORE_MEMORY_SPEC.md`
 - `MEMORY_POLICY_SPEC.md`
+- `ANALYZE_QUERY_SPEC.md`
+- `RETRIEVE_ANSWER_CANDIDATES_SPEC.md`
+- `ASSEMBLE_MEMORY_CONTEXT_SPEC.md`
+- `LINK_MEMORY_SPEC.md`
+- `REORGANIZE_MEMORY_SPEC.md`
 
 ### 4. Documentation structure
 Completed:
@@ -147,15 +152,13 @@ A later refinement pass should likely:
 - constrain reason fields more tightly,
 - reduce repeated instruction text.
 
-### 2. Retrieve-side skill family remains incomplete
-We have maintenance-side retrieval (`retrieve_merge_candidates`, `retrieve_update_candidates`), but not yet the full answer-time retrieval path.
+### 2. Retrieve-side validation is still early
+We now have a minimal retrieve-side pipeline, but retrieve-side executor validation is still at an early seed-set stage.
 
-### 3. Organization-side skill family remains incomplete
-Still missing or underdeveloped:
-- `link_memory`
-- `reorganize_memory`
+### 3. Organization-side execution validation has not started yet
+`link_memory` and `reorganize_memory` are specified, but not yet executor-tested.
 
-### 4. Synthetic testset is still a seed set
+### 4. Synthetic testsets are still seed sets
 Current 18 cases are good enough for v0, but not yet broad enough to claim strong coverage.
 
 ### 5. Current validation is still maintenance-side only

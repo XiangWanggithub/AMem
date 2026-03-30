@@ -3,7 +3,7 @@ from pathlib import Path
 from openai import OpenAI
 from collections import defaultdict
 
-base = Path("/home/kailong/Quant/memory-eval")
+base = Path("/home/kailong/Quant/memory-eval/memory_system_v0")
 cases = [json.loads(line) for line in open(base / "synthetic_organization_cases_v0.jsonl")]
 client = OpenAI(base_url="https://api.minimaxi.com/v1", api_key="sk-cp-8rjY-rdLgaohfjPxT86FUpq2DFAW_lU8OniwxOveVEIKT6T20oLfZrqJzzgaMzxtdOXMzbnrpHfmOJCdTT3_Ic9uBWDPCpcEV_7pc_o0HNr0U_7NwpavDbo")
 

@@ -3,35 +3,36 @@ from pathlib import Path
 from openai import OpenAI
 from collections import defaultdict
 
-base = Path("/home/kailong/Quant/memory-eval")
+base = Path("/home/kailong/Quant/memory-eval/memory_system_v0")
 cases = [json.loads(line) for line in open(base / "synthetic_maintenance_cases_v0.jsonl")]
 client = OpenAI(base_url="https://api.minimaxi.com/v1", api_key="sk-cp-8rjY-rdLgaohfjPxT86FUpq2DFAW_lU8OniwxOveVEIKT6T20oLfZrqJzzgaMzxtdOXMzbnrpHfmOJCdTT3_Ic9uBWDPCpcEV_7pc_o0HNr0U_7NwpavDbo")
 
-families = ["merge", "categorize", "normalize", "update", "score"]
+families = ["extract", "merge", "categorize", "normalize", "update", "score"]
 results = []
 
-RICH_RULES = {
+RULES = {
+    "extract": (base / "EXTRACT_MEMORY_SKILL_V0.md").read_text(),
     "merge": (base / "MERGE_MEMORY_SKILL_V0.md").read_text(),
-    "categorize": "You are executing the categorize_memory skill. Assign a stable final_type and recommended_route. Taxonomy: event, preference, profile, relation, plan, habit, state. Choose the most pragmatically useful category. Return JSON only. Keep the decision conservative and stable.",
-    "update": "You are executing the update_memory skill. Decide whether source_memory should revise or replace an older memory in the same semantic slot. Use update for change, correction, replacement, or revision. Do not use update for duplication or complementary detail. Return JSON only. update_reason must be one short sentence, max 20 words.",
-}
-LIGHT_RULES = {
-    "normalize": "You are executing the normalize_memory skill. Rewrite the memory into a canonical, less ambiguous form. Normalize time when possible, resolve local references when possible, reduce noise, preserve meaning, and do not change final_type. Return JSON only.",
-    "score": "You are executing the score_memory skill. Estimate salience, stability, and future utility for this memory item. Return JSON only. score_reason must be one short sentence, max 20 words.",
+    "categorize": (base / "CATEGORIZE_MEMORY_SPEC.md").read_text(),
+    "normalize": (base / "NORMALIZE_MEMORY_SPEC.md").read_text(),
+    "update": (base / "UPDATE_MEMORY_SPEC.md").read_text(),
+    "score": (base / "SCORE_MEMORY_SPEC.md").read_text(),
 }
 SCHEMAS = {
-    "merge": '{"merge_decision":"merge|no_merge","merge_confidence":0.0,"merge_reason":"short reason","merged_memory":null,"consumed_memory_ids":[]}',
+    "extract": '{"candidates":[{"content":"..."}]}',
+    "merge": '{"merge_decision":"merge|no_merge","merge_confidence":0.0,"merge_reason":"...","merged_memory":null,"consumed_memory_ids":[]}',
     "categorize": '{"final_type":"...","category_confidence":0.0,"recommended_route":"..."}',
     "normalize": '{"normalized_content":"...","final_type":"...","normalization_confidence":0.0}',
-    "update": '{"update_decision":"update|no_update","update_confidence":0.0,"update_reason":"short reason","update_type":"... or null","updated_memory":null,"affected_memory_ids":[]}',
-    "score": '{"salience_score":0.0,"stability_score":0.0,"future_utility_score":0.0,"overall_score":0.0,"score_reason":"short reason"}',
+    "update": '{"update_decision":"update|no_update","update_confidence":0.0,"update_reason":"...","update_type":"... or null","updated_memory":null,"affected_memory_ids":[]}',
+    "score": '{"salience_score":0.0,"stability_score":0.0,"future_utility_score":0.0,"overall_score":0.0,"score_reason":"..."}',
 }
 
 for family in families:
     fam_cases = [c for c in cases if c["family"] == family]
-    rules = RICH_RULES[family] if family in RICH_RULES else LIGHT_RULES[family]
     for case in fam_cases:
-        if family in ("categorize", "normalize", "score"):
+        if family == "extract":
+            payload = {"dialogue_delta": case["inputs"]["dialogue_delta"]}
+        elif family in ("categorize", "normalize", "score"):
             payload = case["inputs"]["source_memory"]
             if "optional_context" in case["inputs"]:
                 payload = {"source_memory": case["inputs"]["source_memory"], "optional_context": case["inputs"]["optional_context"]}
@@ -42,7 +43,8 @@ for family in families:
             }
 
         prompt = (
-            f"{rules}\n\n"
+            f"You are executing the {family}_memory skill. Follow the skill definition exactly. Return JSON only.\n\n"
+            f"{RULES[family]}\n\n"
             f"Output schema:\n```json\n{SCHEMAS[family]}\n```\n\n"
             f"Task input:\n```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```\n"
         )
@@ -51,7 +53,7 @@ for family in families:
             model="MiniMax-M2.5",
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
-            max_tokens=512,
+            max_tokens=1024,
             extra_body={"reasoning_split": True},
         )
         content = resp.choices[0].message.content.strip()
@@ -68,7 +70,10 @@ for family in families:
                 cleaned = cleaned[:-3].strip()
             parsed = json.loads(cleaned)
             exp = case["expected"]
-            if family == "categorize":
+            if family == "extract":
+                got = [c.get("content") for c in parsed.get("candidates", [])]
+                ok = got == exp.get("expected_extract")
+            elif family == "categorize":
                 ok = parsed.get("final_type") == exp.get("expected_final_type") and parsed.get("recommended_route") == exp.get("expected_recommended_route")
             elif family == "normalize":
                 ok = parsed.get("normalized_content") == exp.get("expected_normalized_content")
@@ -95,7 +100,7 @@ for family in families:
         print(family, case["case_id"], "pass=", ok, "tokens=", resp.usage.total_tokens)
 
 (base / "results").mkdir(exist_ok=True)
-with open(base / "results/skill_test_results_round3.json", "w") as f:
+with open(base / "results/skill_test_results_round4.json", "w") as f:
     json.dump(results, f, ensure_ascii=False, indent=2)
 
 agg = defaultdict(lambda: {"pass": 0, "total": 0, "tokens": []})

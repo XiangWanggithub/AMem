@@ -35,3 +35,5 @@ qdrant_storage/
 
 # OpenViking workspace
 openviking_workspace/
+
+memory_system_v0/runtime_state/

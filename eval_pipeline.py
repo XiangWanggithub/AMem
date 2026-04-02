@@ -76,6 +76,13 @@ try:
 except ImportError:
     _METASKILL_AVAILABLE = False
 
+# SrcMemory strategy (optional — wraps src/ MemoryService for fair comparison)
+try:
+    from src_memory_strategy import SrcMemoryStrategy
+    _SRC_MEMORY_AVAILABLE = True
+except ImportError:
+    _SRC_MEMORY_AVAILABLE = False
+
 # ─────────────────────────────────────────────
 # 数据结构
 # ─────────────────────────────────────────────
@@ -1317,7 +1324,7 @@ def main():
     parser.add_argument("--data", required=True, help="LoCoMo 数据路径 (locomo10.json)")
     parser.add_argument(
         "--strategy", default="all",
-        choices=["all", "no_memory", "full_history", "rag", "mem0", "memos", "openviking", "meta_skill"],
+        choices=["all", "no_memory", "full_history", "rag", "mem0", "memos", "openviking", "meta_skill", "src_memory"],
         help="要评测的 memory 策略"
     )
     parser.add_argument("--model", default="MiniMax-M2.5", help="答题模型")
@@ -1354,6 +1361,10 @@ def main():
         if name == "meta_skill" and _METASKILL_AVAILABLE:
             bandit_db = args.load_bandit or args.save_bandit or None
             return MetaSkillStrategy(use_bandit=True, db_path=bandit_db)
+        if name == "src_memory":
+            if not _SRC_MEMORY_AVAILABLE:
+                raise RuntimeError("SrcMemoryStrategy not available — check sys.path")
+            return SrcMemoryStrategy()
         raise ValueError(f"未知策略: {name}")
 
     strategy_names = ["no_memory", "full_history", "rag", "mem0"] if args.strategy == "all" else [args.strategy]

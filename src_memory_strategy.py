@@ -104,6 +104,7 @@ class SrcMemoryStrategy:
         self._service: MemoryService | None = None
         self._sessions: dict[int, dict] = {}
         self._tmp_dir: str | None = None
+        self._last_confidence: float = 0.0
 
     @property
     def name(self) -> str:
@@ -118,6 +119,7 @@ class SrcMemoryStrategy:
                 pass
 
         self._sessions = {}
+        self._last_confidence = 0.0
         self._tmp_dir = tempfile.mkdtemp(prefix="src_eval_")
         db_path = os.path.join(self._tmp_dir, "memory.db")
         self._service = MemoryService(db_path=db_path)
@@ -173,7 +175,10 @@ class SrcMemoryStrategy:
                             _end = chunk_text.find("]")
                             if _end > 0:
                                 _chunk_date = chunk_text[1:_end]
-                        result = await svc.write(chunk_text, session_date=_chunk_date)
+                        result = await asyncio.wait_for(
+                            svc.write(chunk_text, session_date=_chunk_date),
+                            timeout=120.0,
+                        )
                         n_written = len(result.get("written", []))
                         total += 1
                         print(f"[SrcMemory] s{sess_idx}c{chunk_idx} ok: {n_written} facts "
@@ -182,6 +187,15 @@ class SrcMemoryStrategy:
                         if ci < len(chunks) - 1:
                             await asyncio.sleep(_INTER_CHUNK_DELAY)
                         break
+                    except asyncio.TimeoutError:
+                        if attempt < _WRITE_MAX_RETRIES - 1:
+                            delay = _WRITE_RETRY_DELAY * (2 ** attempt)
+                            print(f"[SrcMemory] s{sess_idx}c{chunk_idx} retry {attempt+1}: timeout after 120s")
+                            await asyncio.sleep(delay)
+                        else:
+                            errors += 1
+                            print(f"[SrcMemory] s{sess_idx}c{chunk_idx} FAILED after "
+                                  f"{_WRITE_MAX_RETRIES} attempts (timeout)")
                     except Exception as e:
                         if attempt < _WRITE_MAX_RETRIES - 1:
                             # Exponential backoff: 5, 10, 20, 40s
@@ -221,7 +235,15 @@ class SrcMemoryStrategy:
             self._last_arm_id_used = -1
 
         if not hits:
+            self._last_confidence = 0.0
             return ""
+
+        # Cache top-1 score for IDK confidence gating (sigmoid-normalized by CE)
+        first = hits[0]
+        if isinstance(first, dict):
+            self._last_confidence = float(first.get("score", 0.0))
+        else:
+            self._last_confidence = float(getattr(first, "score", 0.0))
 
         parts = []
         for h in hits:
@@ -233,6 +255,10 @@ class SrcMemoryStrategy:
                 parts.append(content.strip())
 
         return "\n\n---\n\n".join(parts)
+
+    def get_retrieval_confidence(self) -> float:
+        """Return confidence of last retrieval (top-1 score, sigmoid-normalized)."""
+        return self._last_confidence
 
     def record_feedback(self, answer: str) -> None:
         """Pass LLM answer back to MemoryService for Bandit reward recording."""

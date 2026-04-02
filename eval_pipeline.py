@@ -625,7 +625,7 @@ Answer concisely in plain natural language. Do not output anything extra."""
 
 # O4: Confidence-gated IDK instruction (replaces O1 blanket IDK)
 _IDK_INSTRUCTION = 'If the question asks about something not present in the provided memory context, respond with ONLY "I don\'t know".'
-_O4_COSINE_THRESHOLD = 0.45   # for non-CE arms (cosine similarity)
+_O4_COSINE_THRESHOLD = 0.35   # for non-CE arms (cosine similarity); lowered from 0.45 to reduce false IDK
 _O4_TEMPORAL_THRESHOLD = 0.25 # lower threshold for temporal queries (dates have low cosine sim)
 _O4_MULTIHOP_THRESHOLD = 0.15 # inference queries need even lower threshold (indirect context match)
 _O4_CE_THRESHOLD = 0.0        # for CE arms (cross-encoder logit; <0 means <50% relevance)

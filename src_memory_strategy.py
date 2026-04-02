@@ -27,38 +27,38 @@ _META_ROOT = Path("/home/kailong/Mem/workspace/meta-memory")
 if str(_META_ROOT) not in sys.path:
     sys.path.insert(0, str(_META_ROOT))
 
-# Set up env for meta-memory LLM — MiniMax (OpenAI-compatible, fast, no thinking overhead)
+# Set up env for meta-memory LLM — GLM-4 (OpenAI-compatible, for fact extraction in v5 dual-layer)
 # Force-set (not setdefault) because meta_skill_strategy.py import chain may have
-# already set ANTHROPIC_* vars to GLM values before this module loads.
+# already set ANTHROPIC_* vars before this module loads.
 _env_file = "/home/kailong/Quant/memory-eval/.env"
-_minimax_url = ""
-_minimax_key = ""
+_glm_url = ""
+_glm_key = ""
 try:
     with open(_env_file) as _f:
         for _line in _f:
-            if _line.startswith("OPENAI_BASE_URL="):
-                _minimax_url = _line.split("=", 1)[1].strip()
-            elif _line.startswith("OPENAI_API_KEY="):
-                _minimax_key = _line.split("=", 1)[1].strip()
+            if _line.startswith("GLM_BASE_URL="):
+                _glm_url = _line.split("=", 1)[1].strip()
+            elif _line.startswith("GLM_API_KEY="):
+                _glm_key = _line.split("=", 1)[1].strip()
 except FileNotFoundError:
     pass
-os.environ["ANTHROPIC_BASE_URL"] = _minimax_url
-os.environ["ANTHROPIC_AUTH_TOKEN"] = _minimax_key
-os.environ["ANTHROPIC_MODEL"] = "MiniMax-M2.5"
+os.environ["ANTHROPIC_BASE_URL"] = _glm_url
+os.environ["ANTHROPIC_AUTH_TOKEN"] = _glm_key
+os.environ["ANTHROPIC_MODEL"] = "glm-4-flash"
 os.environ["LLM_API_FORMAT"] = "openai"
 
 from src.service import MemoryService
 from src.llm.client import LLMClient as _OrigLLMClient
 
-# Monkey-patch LLMClient.complete_json to strip <think> tags from MiniMax responses
-# before JSON parsing. MiniMax-M2.5 embeds reasoning in content as <think>...</think>.
+# Monkey-patch LLMClient.complete_json to boost max_tokens and strip <think> tags
+# before JSON parsing. Reasoning models embed thinking in content as <think>...</think>.
 import json as _json
 import re as _re
 
 _orig_complete_json = _OrigLLMClient.complete_json
 
 async def _patched_complete_json(self, messages, system_prompt="", max_tokens=2000, extra_body=None):
-    # Boost max_tokens: MiniMax-M2.5 embeds <think>...</think> reasoning in content,
+    # Boost max_tokens: reasoning models embed <think>...</think> in content,
     # consuming ~500-800 tokens before the actual JSON. Original max_tokens=1000 from
     # ExtractFactsSkill leaves too little room for the JSON payload.
     boosted_max = max(max_tokens, 4000)
@@ -79,7 +79,7 @@ async def _patched_complete_json(self, messages, system_prompt="", max_tokens=20
 _OrigLLMClient.complete_json = _patched_complete_json
 
 # Retry config for LLM-dependent operations (write pipeline).
-# GLM-4.7 reasoning model intermittently returns empty content or malformed JSON,
+# GLM-4 intermittently returns empty content or malformed JSON,
 # especially under rapid sequential calls (rate limiting side-effect).
 _WRITE_MAX_RETRIES = 5
 _WRITE_RETRY_DELAY = 5.0
@@ -105,6 +105,7 @@ class SrcMemoryStrategy:
         self._sessions: dict[int, dict] = {}
         self._tmp_dir: str | None = None
         self._last_confidence: float = 0.0
+        self._write_semaphore = asyncio.Semaphore(2)
 
     @property
     def name(self) -> str:
@@ -123,6 +124,15 @@ class SrcMemoryStrategy:
         self._tmp_dir = tempfile.mkdtemp(prefix="src_eval_")
         db_path = os.path.join(self._tmp_dir, "memory.db")
         self._service = MemoryService(db_path=db_path)
+
+        # v5 dual-layer: GLM LLM client is active (via ANTHROPIC_* env vars set above)
+        # so write_pipeline Steps 1-3 run fully:
+        #   Step 1: raw chunk + ST embedding (always runs)
+        #   Step 2: LLM fact extraction (now active — GLM)
+        #   Step 3: dedup + ADD/UPDATE decision (now active — GLM)
+        # Disable entity/relation extraction (Steps 4/4b) — too slow for eval.
+        # write_pipeline checks `if graph_store is not None` before Steps 4/4b.
+        self._service.graph_store = None
 
     def observe(
         self,
@@ -162,6 +172,7 @@ class SrcMemoryStrategy:
                 chunks.append((idx, i // self._CHUNK_SIZE, chunk))
 
         svc = self._service
+        sem = self._write_semaphore
 
         async def _write_all():
             total = 0
@@ -175,10 +186,11 @@ class SrcMemoryStrategy:
                             _end = chunk_text.find("]")
                             if _end > 0:
                                 _chunk_date = chunk_text[1:_end]
-                        result = await asyncio.wait_for(
-                            svc.write(chunk_text, session_date=_chunk_date),
-                            timeout=120.0,
-                        )
+                        async with sem:
+                            result = await asyncio.wait_for(
+                                svc.write(chunk_text, session_date=_chunk_date),
+                                timeout=120.0,
+                            )
                         n_written = len(result.get("written", []))
                         total += 1
                         print(f"[SrcMemory] s{sess_idx}c{chunk_idx} ok: {n_written} facts "

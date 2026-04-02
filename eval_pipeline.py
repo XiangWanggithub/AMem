@@ -627,11 +627,23 @@ Answer concisely in plain natural language. Do not output anything extra."""
 _IDK_INSTRUCTION = 'If the question asks about something not present in the provided memory context, respond with ONLY "I don\'t know".'
 _O4_COSINE_THRESHOLD = 0.45   # for non-CE arms (cosine similarity)
 _O4_TEMPORAL_THRESHOLD = 0.25 # lower threshold for temporal queries (dates have low cosine sim)
+_O4_MULTIHOP_THRESHOLD = 0.15 # inference queries need even lower threshold (indirect context match)
 _O4_CE_THRESHOLD = 0.0        # for CE arms (cross-encoder logit; <0 means <50% relevance)
 
 import re as _re
 def _is_temporal_query(q: str) -> bool:
     return bool(_re.search(r'\b(when|what date|what time|how long ago|which year|which month|which day|how old|since when)\b', q.lower()))
+
+def _is_multihop_inference_query(q: str) -> bool:
+    """Detect multi-hop inference questions that require reasoning from context."""
+    q_lower = q.lower().strip()
+    return (
+        q_lower.startswith("would ") or
+        q_lower.startswith("is it likely") or
+        _re.search(r"\bwould .+\b(be|have|likely|consider|pursue|want)\b", q_lower) is not None or
+        "be considered" in q_lower or
+        "likely to" in q_lower
+    )
 
 class AgentLoop:
     def __init__(self, memory: MemoryStrategy, model: str = "MiniMax-M2.5",
@@ -674,7 +686,12 @@ class AgentLoop:
             conf = self.memory.get_retrieval_confidence()
             arm_id = getattr(self.memory, '_last_arm_id_used', None)
             is_ce_arm = arm_id is not None and arm_id >= 3
-            cosine_thresh = _O4_TEMPORAL_THRESHOLD if _is_temporal_query(question) else _O4_COSINE_THRESHOLD
+            if _is_temporal_query(question):
+                cosine_thresh = _O4_TEMPORAL_THRESHOLD
+            elif _is_multihop_inference_query(question):
+                cosine_thresh = _O4_MULTIHOP_THRESHOLD
+            else:
+                cosine_thresh = _O4_COSINE_THRESHOLD
             threshold = _O4_CE_THRESHOLD if is_ce_arm else cosine_thresh
             if conf < threshold:
                 active_system_prompt = SYSTEM_PROMPT + "\n" + _IDK_INSTRUCTION

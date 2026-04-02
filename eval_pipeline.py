@@ -69,6 +69,13 @@ try:
 except ImportError:
     pass  # 没装 python-dotenv 时直接跳过，依赖环境变量
 
+# MetaSkill strategy (optional import — skipped if meta-memory not available)
+try:
+    from meta_skill_strategy import MetaSkillStrategy
+    _METASKILL_AVAILABLE = True
+except ImportError:
+    _METASKILL_AVAILABLE = False
+
 # ─────────────────────────────────────────────
 # 数据结构
 # ─────────────────────────────────────────────
@@ -110,6 +117,7 @@ class EvalResult:
     f1_score: float        # token-level F1，与 LoCoMo 官方对齐
     latency_ms: float
     tokens_used: int
+    arm_id: int = -1
 
 # ─────────────────────────────────────────────
 # LoCoMo 数据加载
@@ -604,8 +612,19 @@ class Mem0Memory(MemoryStrategy):
 # ─────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are a helpful assistant. You will be given relevant memory context from a conversation (if available), followed by a question. Answer the question based on the memory context.
-If the answer is not found in the memory, say "I don't know" honestly. Do not make up information.
+If the specific event, person, or fact asked about is not mentioned anywhere in the memory context, respond with ONLY "I don't know". Do not invent events or facts that are not referenced in the provided memory.
+When answering about dates or times, compute absolute dates from relative expressions (yesterday, last week, next month, etc.) using the [YYYY-MM-DD] date shown at the start of each memory segment. This date computation is part of answering correctly, not inventing information.
 Answer concisely in plain natural language. Do not output anything extra."""
+
+# O4: Confidence-gated IDK instruction (replaces O1 blanket IDK)
+_IDK_INSTRUCTION = 'If the question asks about something not present in the provided memory context, respond with ONLY "I don\'t know".'
+_O4_COSINE_THRESHOLD = 0.45   # for non-CE arms (cosine similarity)
+_O4_TEMPORAL_THRESHOLD = 0.25 # lower threshold for temporal queries (dates have low cosine sim)
+_O4_CE_THRESHOLD = 0.0        # for CE arms (cross-encoder logit; <0 means <50% relevance)
+
+import re as _re
+def _is_temporal_query(q: str) -> bool:
+    return bool(_re.search(r'\b(when|what date|what time|how long ago|which year|which month|which day|how old|since when)\b', q.lower()))
 
 class AgentLoop:
     def __init__(self, memory: MemoryStrategy, model: str = "MiniMax-M2.5",
@@ -631,14 +650,29 @@ class AgentLoop:
         if hasattr(self.memory, "flush"):
             self.memory.flush()
 
-    def answer(self, question: str) -> tuple[str, float, int]:
-        """回答一个 probe 问题，返回 (answer, latency_ms, tokens)"""
+    def answer(self, question: str) -> tuple[str, float, int, int]:
+        """回答一个 probe 问题，返回 (answer, latency_ms, tokens, arm_id)"""
         # RAGMemory supports client param for query rewriting; others ignore it
         if hasattr(self.memory, "_rewrite_query"):
             context = self.memory.retrieve(question, client=self.client)
         else:
             context = self.memory.retrieve(question)
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+        # Capture arm_id after retrieve
+        arm_id = getattr(self.memory, '_last_arm_id_used', -1)
+
+        # O4: confidence-gated IDK instruction
+        active_system_prompt = SYSTEM_PROMPT
+        if hasattr(self.memory, 'get_retrieval_confidence'):
+            conf = self.memory.get_retrieval_confidence()
+            arm_id = getattr(self.memory, '_last_arm_id_used', None)
+            is_ce_arm = arm_id is not None and arm_id >= 3
+            cosine_thresh = _O4_TEMPORAL_THRESHOLD if _is_temporal_query(question) else _O4_COSINE_THRESHOLD
+            threshold = _O4_CE_THRESHOLD if is_ce_arm else cosine_thresh
+            if conf < threshold:
+                active_system_prompt = SYSTEM_PROMPT + "\n" + _IDK_INSTRUCTION
+
+        messages = [{"role": "system", "content": active_system_prompt}]
         if context:
             messages.append({
                 "role": "user",
@@ -658,7 +692,7 @@ class AgentLoop:
         if self._is_glm:
             # Disable thinking mode for GLM-4.7
             create_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-        @retry_on_rate_limit(max_retries=3, initial_delay=2.0)
+        @retry_on_rate_limit(max_retries=3, delays=[2, 5, 10])
         def _call_llm():
             return self.client.chat.completions.create(**create_kwargs)
         resp = _call_llm()
@@ -670,7 +704,7 @@ class AgentLoop:
         import re as _re
         cleaned = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL).strip()
         prediction = cleaned if cleaned else raw
-        return prediction, latency_ms, tokens
+        return prediction, latency_ms, tokens, arm_id
 
 # ─────────────────────────────────────────────
 # LLM Judge
@@ -820,12 +854,18 @@ def run_eval(
                 qa_subset = [q for q in qa_subset if q.category in categories]
             qa_subset = qa_subset[:max_qa_per_conv]
 
+            _global_q_idx = len(all_results)  # running question index across all convs
             for i, qa in enumerate(qa_subset):
                 try:
-                    prediction, latency_ms, tokens = agent.answer(qa.question)
+                    prediction, latency_ms, tokens, arm_id = agent.answer(qa.question)
                 except Exception as e:
                     print(f"    [answer error] {type(e).__name__}: {str(e)[:60]}, skipping")
-                    prediction, latency_ms, tokens = "", 0.0, 0
+                    prediction, latency_ms, tokens, arm_id = "", 0.0, 0, -1
+
+                # Feed answer back to strategy for Bandit reward
+                if hasattr(agent.memory, 'record_feedback'):
+                    agent.memory.record_feedback(prediction)
+
                 try:
                     score = judge.score(qa.question, qa.answer, prediction, category=qa.category)
                 except Exception as e:
@@ -833,6 +873,11 @@ def run_eval(
                     score = 0.0
 
                 f1 = compute_f1(prediction, qa.answer)
+
+                # Online reward feedback for adaptive strategies
+                if hasattr(strategy, 'update_reward'):
+                    strategy.update_reward(qa.question, score)
+
                 result = EvalResult(
                     strategy_name=strategy.name,
                     sample_id=conv.sample_id,
@@ -844,11 +889,22 @@ def run_eval(
                     f1_score=f1,
                     latency_ms=latency_ms,
                     tokens_used=tokens,
+                    arm_id=arm_id if arm_id is not None else -1,
                 )
                 all_results.append(result)
 
+                # Bandit snapshot every 50 questions
+                question_index = _global_q_idx + i
+                if (question_index % 50 == 0) and hasattr(strategy, 'get_bandit_snapshot'):
+                    snapshot = strategy.get_bandit_snapshot()
+                    snapshot['index'] = question_index
+                    snapshot['timestamp'] = time.time()
+                    os.makedirs('results', exist_ok=True)
+                    with open('results/bandit_evolution.jsonl', 'a') as f:
+                        f.write(json.dumps(snapshot) + '\n')
+
                 status = "✓" if score >= 0.5 else "✗"
-                print(f"    [{i+1}/{len(qa_subset)}] {status} judge={score:.1f} f1={f1:.2f} [{qa.category}] {qa.question[:40]}...")
+                print(f"    [{i+1}/{len(qa_subset)}] {status} judge={score:.1f} f1={f1:.2f} arm={arm_id} [{qa.category}] {qa.question[:40]}...")
 
     return all_results
 
@@ -901,6 +957,7 @@ def save_results(results: list[EvalResult], output_path: str):
             "f1_score": r.f1_score,
             "latency_ms": r.latency_ms,
             "tokens_used": r.tokens_used,
+            "arm_id": r.arm_id,
         }
         for r in results
     ]
@@ -1260,7 +1317,7 @@ def main():
     parser.add_argument("--data", required=True, help="LoCoMo 数据路径 (locomo10.json)")
     parser.add_argument(
         "--strategy", default="all",
-        choices=["all", "no_memory", "full_history", "rag", "mem0", "memos", "openviking"],
+        choices=["all", "no_memory", "full_history", "rag", "mem0", "memos", "openviking", "meta_skill"],
         help="要评测的 memory 策略"
     )
     parser.add_argument("--model", default="MiniMax-M2.5", help="答题模型")
@@ -1277,6 +1334,8 @@ def main():
     parser.add_argument("--conv-ids", nargs="*", default=None,
                         help="只跑指定对话 ID，例如: --conv-ids conv-26 conv-30（不传则跑全部）")
     parser.add_argument("--output", default="results/results.json", help="结果输出路径")
+    parser.add_argument("--save-bandit", default="", help="Exp3: save final bandit state to this SQLite path")
+    parser.add_argument("--load-bandit", default="", help="Exp3: load bandit state from this SQLite path (warm start)")
     args = parser.parse_args()
 
     # 加载数据
@@ -1292,6 +1351,9 @@ def main():
         if name == "mem0":        return Mem0Memory()
         if name == "memos":       return MemOSStrategy()
         if name == "openviking":  return OpenVikingStrategy()
+        if name == "meta_skill" and _METASKILL_AVAILABLE:
+            bandit_db = args.load_bandit or args.save_bandit or None
+            return MetaSkillStrategy(use_bandit=True, db_path=bandit_db)
         raise ValueError(f"未知策略: {name}")
 
     strategy_names = ["no_memory", "full_history", "rag", "mem0"] if args.strategy == "all" else [args.strategy]
@@ -1329,6 +1391,13 @@ def main():
         answer_base_url=answer_base_url,
         answer_api_key=answer_api_key,
     )
+
+    # Force-save bandit state if --save-bandit was specified
+    if args.save_bandit:
+        for s in strategies:
+            if hasattr(s, 'force_save_bandit'):
+                s.force_save_bandit()
+                print(f"[exp3] Bandit state saved to {args.save_bandit}")
 
     # 汇总 & 保存
     summarize(results)

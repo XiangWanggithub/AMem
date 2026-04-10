@@ -619,16 +619,36 @@ class Mem0Memory(MemoryStrategy):
 # ─────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are a helpful assistant. You will be given relevant memory context from a conversation (if available), followed by a question. Answer the question based on the memory context.
-If the specific event, person, or fact asked about is not mentioned anywhere in the memory context, respond with ONLY "I don't know". Do not invent events or facts that are not referenced in the provided memory.
+
+CRITICAL: Answer ONLY from information EXPLICITLY stated in the memory context.
+- The SPECIFIC DETAIL asked must be directly present in the context — it is NOT enough that the general topic or person is mentioned.
+- If related information is present but the exact answer is not stated, respond with ONLY "I don't know".
+- You may combine multiple explicitly stated facts to answer (e.g., finding what two people have in common).
+- Do NOT infer, guess, or extrapolate details that are not written in the context.
+- Do NOT invent events, dates, or facts that are not directly referenced in the provided memory.
+
 When answering about dates or times, compute absolute dates from relative expressions (yesterday, last week, next month, etc.) using the [YYYY-MM-DD] date shown at the start of each memory segment. This date computation is part of answering correctly, not inventing information.
+Answer concisely in plain natural language. Do not output anything extra."""
+
+# V5: Separate prompt for inference-type multi-hop ("Would X do Y?")
+# These questions require reasoning from stated facts rather than direct lookup.
+# The strict "Do NOT infer" rule breaks them — they NEED inference to answer correctly.
+SYSTEM_PROMPT_INFERENCE = """You are a helpful assistant. You will be given relevant memory context from a conversation (if available), followed by a question. Answer the question based on the memory context.
+
+Answer based on the memory context. You may reason from explicitly stated facts to answer questions about what someone would likely do, feel, or experience (e.g., "Would X pursue Y given Z?"). Combine stated facts and preferences to infer reasonable answers.
+If NO relevant information about the person or topic is in the context, respond with ONLY "I don't know".
+Do NOT invent facts — base all reasoning on what is explicitly written in the context.
+
+When answering about dates or times, compute absolute dates from relative expressions (yesterday, last week, next month, etc.) using the [YYYY-MM-DD] date shown at the start of each memory segment.
 Answer concisely in plain natural language. Do not output anything extra."""
 
 # O4: Confidence-gated IDK instruction (replaces O1 blanket IDK)
 _IDK_INSTRUCTION = 'If the question asks about something not present in the provided memory context, respond with ONLY "I don\'t know".'
 _O4_COSINE_THRESHOLD = 0.45   # for non-CE arms (cosine similarity)
 _O4_TEMPORAL_THRESHOLD = 0.25 # lower threshold for temporal queries (dates have low cosine sim)
-_O4_MULTIHOP_THRESHOLD = 0.15 # inference queries need even lower threshold (indirect context match)
+_O4_MULTIHOP_THRESHOLD = -1.0 # V5: inference queries — NEVER add IDK (entity context always relevant)
 _O4_CE_THRESHOLD = 0.0        # for CE arms (cross-encoder logit; <0 means <50% relevance)
+_O5B_CE_THRESHOLD = 0.0      # O5b: CE answerability gate threshold (logit < 0 → IDK instruction)
 
 import re as _re
 def _is_temporal_query(q: str) -> bool:
@@ -680,16 +700,25 @@ class AgentLoop:
         # Capture arm_id after retrieve
         arm_id = getattr(self.memory, '_last_arm_id_used', -1)
 
-        # O4: confidence-gated IDK instruction
-        active_system_prompt = SYSTEM_PROMPT
-        if hasattr(self.memory, 'get_retrieval_confidence'):
+        # V5: category-aware system prompt — inference queries use permissive prompt
+        is_inference = _is_multihop_inference_query(question)
+        active_system_prompt = SYSTEM_PROMPT_INFERENCE if is_inference else SYSTEM_PROMPT
+
+        # O5b: CE answerability gate (preferred, takes precedence over O4 cosine gate).
+        # CE score (MS-MARCO logit) measures "does this chunk directly answer the question?"
+        # Catches partial-topic adversarial failures: entity context is present (high cosine)
+        # but specific event is NOT in the conversation (low CE answerability).
+        if hasattr(self.memory, 'get_ce_answerability') and not is_inference:
+            ce_score = self.memory.get_ce_answerability()
+            if ce_score is not None and ce_score < _O5B_CE_THRESHOLD:
+                active_system_prompt = SYSTEM_PROMPT + "\n" + _IDK_INSTRUCTION
+        # O4: cosine-confidence IDK gate fallback (used when O5b CE model unavailable)
+        elif hasattr(self.memory, 'get_retrieval_confidence') and not is_inference:
             conf = self.memory.get_retrieval_confidence()
             arm_id = getattr(self.memory, '_last_arm_id_used', None)
             is_ce_arm = arm_id is not None and arm_id >= 3
             if _is_temporal_query(question):
                 cosine_thresh = _O4_TEMPORAL_THRESHOLD
-            elif _is_multihop_inference_query(question):
-                cosine_thresh = _O4_MULTIHOP_THRESHOLD
             else:
                 cosine_thresh = _O4_COSINE_THRESHOLD
             threshold = _O4_CE_THRESHOLD if is_ce_arm else cosine_thresh
@@ -803,7 +832,14 @@ Output only: 0.0, 0.5, or 1.0"""
 
 class LLMJudge:
     def __init__(self, model: str = "MiniMax-M2.5"):
-        self.client = OpenAI()
+        # Auto-select API config: GLM models use GLM_BASE_URL/GLM_API_KEY,
+        # others fall back to OPENAI_* env vars.
+        if "glm" in model.lower():
+            _base_url = os.environ.get("GLM_BASE_URL", "")
+            _api_key = os.environ.get("GLM_API_KEY", "")
+            self.client = OpenAI(base_url=_base_url, api_key=_api_key) if _base_url else OpenAI()
+        else:
+            self.client = OpenAI()
         self.model = model
 
     def score(self, question: str, reference: str, prediction: str, category: str = "") -> float:
@@ -1357,6 +1393,8 @@ def main():
     parser.add_argument("--categories", nargs="*", help="只测指定类别 (single-hop temporal multi-hop open-domain)")
     parser.add_argument("--conv-ids", nargs="*", default=None,
                         help="只跑指定对话 ID，例如: --conv-ids conv-26 conv-30（不传则跑全部）")
+    parser.add_argument("--mode", choices=["selective", "exhaustive", "hybrid"], default="selective",
+                        help="Memory mode for src_memory strategy (default: selective)")
     parser.add_argument("--output", default="results/results.json", help="结果输出路径")
     parser.add_argument("--save-bandit", default="", help="Exp3: save final bandit state to this SQLite path")
     parser.add_argument("--load-bandit", default="", help="Exp3: load bandit state from this SQLite path (warm start)")
@@ -1381,7 +1419,7 @@ def main():
         if name == "src_memory":
             if not _SRC_MEMORY_AVAILABLE:
                 raise RuntimeError("SrcMemoryStrategy not available — check sys.path")
-            return SrcMemoryStrategy()
+            return SrcMemoryStrategy(mode=args.mode)
         raise ValueError(f"未知策略: {name}")
 
     strategy_names = ["no_memory", "full_history", "rag", "mem0"] if args.strategy == "all" else [args.strategy]
@@ -1430,6 +1468,11 @@ def main():
     # 汇总 & 保存
     summarize(results)
     save_results(results, args.output)
+
+    # Dump per-QA phase log if strategy supports it
+    for s in strategies:
+        if hasattr(s, 'dump_phase_log'):
+            s.dump_phase_log()
 
 if __name__ == "__main__":
     main()

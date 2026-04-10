@@ -102,7 +102,11 @@ _OrigLLMClient.complete_json = _patched_complete_json
 # especially under rapid sequential calls (rate limiting side-effect).
 _WRITE_MAX_RETRIES = 5
 _WRITE_RETRY_DELAY = 5.0
-_INTER_CHUNK_DELAY = 2.0  # seconds between successful chunk writes
+# Inter-chunk delay: seconds between successful chunk writes.
+# Configurable via SRC_MEMORY_INTER_CHUNK_DELAY env var (default 2.0s).
+# Set to 0.0 for eval scenarios where the write semaphore handles rate limits.
+# Example: SRC_MEMORY_INTER_CHUNK_DELAY=0 python eval_longmemeval.py ...
+_INTER_CHUNK_DELAY = float(os.environ.get("SRC_MEMORY_INTER_CHUNK_DELAY", "2.0"))
 
 
 class SrcMemoryStrategy:

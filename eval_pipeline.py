@@ -273,8 +273,17 @@ class RAGMemory(MemoryStrategy):
     依赖: pip install sentence-transformers numpy
     """
 
-    def __init__(self, top_k: int = 3, embedding_model: str = "/home/models/bge-large-en-v1.5"):
+    def __init__(self, top_k: int = 3, embedding_model: str = "/home/models/bge-large-en-v1.5",
+                 chunk_turns: int = 0, disable_rewrite: bool = False, entry_format: str = "narrative",
+                 sort_by_relevance: bool = False, separator: str = "\n\n"):
         self.top_k = top_k
+        self.chunk_turns = chunk_turns  # 0 = session-level (original); >0 = N-turn sub-chunks
+        self.disable_rewrite = disable_rewrite
+        # "narrative" = 'Speaker said, "text"' (original); "compact" = "Speaker: text" (matches exhaustive)
+        self.entry_format = entry_format
+        # sort_by_relevance: if True, return chunks sorted by score (exhaustive behavior); else by time
+        self.sort_by_relevance = sort_by_relevance
+        self.separator = separator
         # session_idx -> list of turn strings
         self._session_turns: dict[int, list[str]] = {}
         self._session_dates: dict[int, str] = {}
@@ -290,7 +299,10 @@ class RAGMemory(MemoryStrategy):
             raise ImportError("pip install sentence-transformers")
 
     @property
-    def name(self): return f"rag_session_top{self.top_k}"
+    def name(self):
+        if self.chunk_turns > 0:
+            return f"rag_{self.chunk_turns}turn_top{self.top_k}"
+        return f"rag_session_top{self.top_k}"
 
     def reset(self):
         self._session_turns = {}
@@ -303,17 +315,24 @@ class RAGMemory(MemoryStrategy):
         return self._st_model.encode(text, normalize_embeddings=True).tolist()
 
     def _build_chunks(self):
-        """把 session_turns 整合成 session 级别 chunk 并做 embedding（只在第一次 retrieve 时触发）"""
-        import numpy as np
+        """把 session_turns 整合成 chunk 并做 embedding（只在第一次 retrieve 时触发）。
+        chunk_turns=0: session 级别 (原始行为)；chunk_turns>0: N-turn 子块（消融用）"""
         self.chunks = []
         self.embeddings = []
         for idx in sorted(self._session_turns.keys()):
             date = self._session_dates.get(idx, "")
             turns = self._session_turns[idx]
             header = f"[{date}]" if date else f"[Session {idx}]"
-            chunk = header + "\n" + "\n".join(turns)
-            self.chunks.append(chunk)
-            self.embeddings.append(self._embed(chunk))
+            if self.chunk_turns > 0:
+                for i in range(0, len(turns), self.chunk_turns):
+                    sub = turns[i:i + self.chunk_turns]
+                    chunk = header + "\n" + "\n".join(sub)
+                    self.chunks.append(chunk)
+                    self.embeddings.append(self._embed(chunk))
+            else:
+                chunk = header + "\n" + "\n".join(turns)
+                self.chunks.append(chunk)
+                self.embeddings.append(self._embed(chunk))
         self._chunks_built = True
 
     def observe(self, speaker: str, text: str, session_date: str = "", session_idx: int = -1, blip_caption: str = ""):
@@ -321,9 +340,14 @@ class RAGMemory(MemoryStrategy):
         if session_idx not in self._session_turns:
             self._session_turns[session_idx] = []
             self._session_dates[session_idx] = session_date
-        entry = f'{speaker} said, "{text}"'
-        if blip_caption:
-            entry += f" and shared {blip_caption}"
+        if self.entry_format == "compact":
+            entry = f"{speaker}: {text}"
+            if blip_caption:
+                entry += f" and shared {blip_caption}"
+        else:
+            entry = f'{speaker} said, "{text}"'
+            if blip_caption:
+                entry += f" and shared {blip_caption}"
         self._session_turns[session_idx].append(entry)
         self._chunks_built = False  # 有新数据，需要重新 build
 
@@ -358,7 +382,7 @@ class RAGMemory(MemoryStrategy):
             self._build_chunks()
         import numpy as np
         # query 改写
-        search_query = self._rewrite_query(query, client) if client else query
+        search_query = self._rewrite_query(query, client) if (client and not self.disable_rewrite) else query
         q_emb = np.array(self._embed(search_query))
         scores = [
             np.dot(q_emb, np.array(e)) /
@@ -366,8 +390,11 @@ class RAGMemory(MemoryStrategy):
             for e in self.embeddings
         ]
         top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:self.top_k]
-        top_idx_sorted = sorted(top_idx)  # 按时间顺序返回
-        return "\n\n".join(self.chunks[i] for i in top_idx_sorted)
+        if self.sort_by_relevance:
+            ordered = top_idx  # relevance-descending (matches exhaustive behavior)
+        else:
+            ordered = sorted(top_idx)  # 按时间顺序返回
+        return self.separator.join(self.chunks[i] for i in ordered)
 
 # ─────────────────────────────────────────────
 # Baseline D: Mem0Memory
@@ -1395,6 +1422,12 @@ def main():
                         help="只跑指定对话 ID，例如: --conv-ids conv-26 conv-30（不传则跑全部）")
     parser.add_argument("--mode", choices=["selective", "exhaustive", "hybrid"], default="selective",
                         help="Memory mode for src_memory strategy (default: selective)")
+    parser.add_argument("--no-rewrite", action="store_true", default=False,
+                        help="RAGMemory: 禁用 query rewrite（对照实验用）")
+    parser.add_argument("--chunk-turns", type=int, default=0,
+                        help="RAG ablation: split sessions into N-turn sub-chunks (0=session-level, default)")
+    parser.add_argument("--chunk-size", type=int, default=8,
+                        help="SrcMemory chunk size (N-turn sub-chunks; 0=session-level)")
     parser.add_argument("--output", default="results/results.json", help="结果输出路径")
     parser.add_argument("--save-bandit", default="", help="Exp3: save final bandit state to this SQLite path")
     parser.add_argument("--load-bandit", default="", help="Exp3: load bandit state from this SQLite path (warm start)")
@@ -1409,7 +1442,9 @@ def main():
     def build_strategy(name):
         if name == "no_memory":   return NoMemory()
         if name == "full_history": return FullHistory()
-        if name == "rag":         return RAGMemory(top_k=args.top_k, embedding_model=args.embedding_model)
+        if name == "rag":         return RAGMemory(top_k=args.top_k, embedding_model=args.embedding_model,
+                                                   chunk_turns=args.chunk_turns,
+                                                   disable_rewrite=args.no_rewrite)
         if name == "mem0":        return Mem0Memory()
         if name == "memos":       return MemOSStrategy()
         if name == "openviking":  return OpenVikingStrategy()
@@ -1419,7 +1454,7 @@ def main():
         if name == "src_memory":
             if not _SRC_MEMORY_AVAILABLE:
                 raise RuntimeError("SrcMemoryStrategy not available — check sys.path")
-            return SrcMemoryStrategy(mode=args.mode)
+            return SrcMemoryStrategy(mode=args.mode, chunk_size=args.chunk_size)
         raise ValueError(f"未知策略: {name}")
 
     strategy_names = ["no_memory", "full_history", "rag", "mem0"] if args.strategy == "all" else [args.strategy]

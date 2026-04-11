@@ -123,8 +123,18 @@ class SrcMemoryStrategy:
     # reasoning model has token budget left for actual JSON output.
     _CHUNK_SIZE = 8
 
-    def __init__(self, mode: str = "selective") -> None:
+    def __init__(self, mode: str = "selective", chunk_size: int = 8) -> None:
         self.mode = mode
+        # chunk_size semantics:
+        #   > 0  : sub-chunk size in turns (e.g. 8 = 8-turn chunks)
+        #   = 0  : session-level (one chunk per session, tagged "session")
+        #   = -1 : DUAL — store BOTH 8-turn chunks ("chunk") AND session-level ("session")
+        #          so service.py _query_exhaustive can route by QueryType.
+        self._dual_granularity = (chunk_size == -1)
+        if chunk_size == -1:
+            self._chunk_size = 8  # sub-chunk size for the "chunk" tier in dual mode
+        else:
+            self._chunk_size = chunk_size if chunk_size > 0 else 999999
         self._service: MemoryService | None = None
         self._sessions: dict[int, dict] = {}
         self._tmp_dir: str | None = None
@@ -238,18 +248,33 @@ class SrcMemoryStrategy:
             return
 
         # Build all chunks up front
-        chunks: list[tuple[int, int, str]] = []  # (session_idx, chunk_idx, text)
+        # Each entry: (session_idx, chunk_idx, text, granularity)
+        chunks: list[tuple[int, int, str, str]] = []
         for idx in sorted(self._sessions.keys()):
             sess = self._sessions[idx]
             date = sess["date"]
             turns = sess["turns"]
-            for i in range(0, len(turns), self._CHUNK_SIZE):
-                sub_turns = turns[i : i + self._CHUNK_SIZE]
-                if date:
-                    chunk = f"[{date}]\n" + "\n".join(sub_turns)
-                else:
-                    chunk = "\n".join(sub_turns)
-                chunks.append((idx, i // self._CHUNK_SIZE, chunk))
+
+            if self._dual_granularity:
+                # Tier 1: 8-turn fine-grained chunks (tagged "chunk")
+                for i in range(0, len(turns), self._chunk_size):
+                    sub_turns = turns[i : i + self._chunk_size]
+                    sub_text = (f"[{date}]\n" if date else "") + "\n".join(sub_turns)
+                    chunks.append((idx, i // self._chunk_size, sub_text, "chunk"))
+                # Tier 2: session-level chunk (tagged "session")
+                sess_text = (f"[{date}]\n" if date else "") + "\n".join(turns)
+                chunks.append((idx, 999, sess_text, "session"))
+            else:
+                # Single granularity: chunks inherit "chunk" tag (8-turn) or
+                # "session" tag (if chunk_size == 0).
+                single_gran = "session" if self._chunk_size >= 999999 else "chunk"
+                for i in range(0, len(turns), self._chunk_size):
+                    sub_turns = turns[i : i + self._chunk_size]
+                    if date:
+                        chunk = f"[{date}]\n" + "\n".join(sub_turns)
+                    else:
+                        chunk = "\n".join(sub_turns)
+                    chunks.append((idx, i // self._chunk_size, chunk, single_gran))
 
         svc = self._service
         sem = self._write_semaphore
@@ -257,7 +282,7 @@ class SrcMemoryStrategy:
         async def _write_all():
             total = 0
             errors = 0
-            for ci, (sess_idx, chunk_idx, chunk_text) in enumerate(chunks):
+            for ci, (sess_idx, chunk_idx, chunk_text, chunk_gran) in enumerate(chunks):
                 for attempt in range(_WRITE_MAX_RETRIES):
                     try:
                         # Extract session_date from chunk header [YYYY-MM-DD]
@@ -268,7 +293,12 @@ class SrcMemoryStrategy:
                                 _chunk_date = chunk_text[1:_end]
                         async with sem:
                             result = await asyncio.wait_for(
-                                svc.write(chunk_text, session_date=_chunk_date, enable_relation_enrichment=False),
+                                svc.write(
+                                    chunk_text,
+                                    session_date=_chunk_date,
+                                    enable_relation_enrichment=False,
+                                    granularity=chunk_gran,
+                                ),
                                 timeout=120.0,
                             )
                         n_written = len(result.get("written", []))

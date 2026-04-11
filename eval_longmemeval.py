@@ -204,9 +204,10 @@ def main():
         ):
             question = (
                 question
-                + "\nHint: First, find the [YYYY-MM-DD] date header for each relevant event"
-                " in the memory context and list those dates explicitly. Then use those dates"
-                " to answer the question (compute the difference, or determine the order)."
+                + "\nHint: First, find the date header (e.g. [2023/02/15 (Wed)]) for each"
+                " relevant event in the memory context and list those dates explicitly."
+                " Then use those dates to answer the question (compute the difference, or"
+                " determine the order)."
             )
         try:
             prediction, latency_ms, tokens, arm_id = agent.answer(question)

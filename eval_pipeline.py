@@ -83,6 +83,13 @@ try:
 except ImportError:
     _SRC_MEMORY_AVAILABLE = False
 
+# V1Memory strategy (optional — wraps src/ v0.1 hierarchical memory substrate)
+try:
+    from v1_memory_strategy import V1MemoryStrategy
+    _V1_MEMORY_AVAILABLE = True
+except ImportError:
+    _V1_MEMORY_AVAILABLE = False
+
 # ─────────────────────────────────────────────
 # 数据结构
 # ─────────────────────────────────────────────
@@ -125,6 +132,13 @@ class EvalResult:
     latency_ms: float
     tokens_used: int
     arm_id: int = -1
+    # No-leak Phase B (P-1): failure category from constrained vocabulary,
+    # emitted only when judge_score < 1.0. Used by MetaOptimizer as a
+    # production-realistic signal in place of raw gold-answer strings.
+    failure_category: str = ""
+    # Retrieval diagnostics (Option D): per-QA metrics exposed by the strategy
+    # via ._last_retrieval_metrics. Empty dict if strategy does not expose it.
+    retrieval_metrics: dict = field(default_factory=dict)
 
 # ─────────────────────────────────────────────
 # LoCoMo 数据加载
@@ -842,6 +856,40 @@ Prediction: {prediction}
 
 Score (0.0, 0.5, or 1.0):"""
 
+# No-leak Phase B (P-1): judge prompt that also emits a constrained-vocabulary
+# failure_category. Optimizer downstream sees ONLY the category name — never the
+# reference string — so gold-answer leakage is prevented by construction.
+JUDGE_PROMPT_WITH_COMMENTARY = """Score the prediction against the reference answer AND categorize any failure. Output ONLY a valid JSON object — no prose, no markdown.
+
+Scoring rules:
+- 1.0: Prediction is semantically correct (e.g. "May 7, 2023" = "7 May 2023", minor wording OK)
+- 0.5: Prediction is partially correct (contains some but not all key info)
+- 0.0: Prediction is wrong, irrelevant, or says "I don't know" / "no information" / "not provided"
+
+If score < 1.0, ALSO return failure_category from this FIXED vocabulary (do NOT invent new ones):
+- retrieval_miss: system failed to retrieve the relevant context at all
+- grounding_error: retrieved context exists but answer not anchored to it
+- temporal_misalignment: wrong date/time reference (e.g. predicted wrong month/year)
+- aggregation_incomplete: partial answer — missing one or more required elements
+- reasoning_error: context present but wrong inference / wrong hop
+- hallucination: prediction is a specific fabricated answer unsupported by context
+- ambiguous: failure type unclear
+
+If score == 1.0, set failure_category to null.
+
+CRITICAL LEAKAGE CONSTRAINTS — your output is consumed by an automated optimizer that must NEVER see the gold answer:
+- Do NOT repeat or paraphrase the reference answer anywhere in your output.
+- Do NOT mention specific entities, names, dates, numbers, or places from the reference.
+- Do NOT explain "the correct answer is …" — only emit the category token.
+- Output ONLY the fixed JSON schema; any extra prose risks leaking gold information.
+
+Question: {question}
+Reference: {reference}
+Prediction: {prediction}
+
+Output JSON (no other text):
+{{"score": 0.0|0.5|1.0, "failure_category": "<one-of-vocab-or-null>"}}"""
+
 # adversarial 类别专用 prompt：
 # 标准答案是空字符串——这类问题在对话里根本没有答案
 # 模型回答 "I don't know" / "not mentioned" / "no information" 应该得满分
@@ -857,8 +905,37 @@ Prediction: {prediction}
 
 Output only: 0.0, 0.5, or 1.0"""
 
+JUDGE_PROMPT_ADVERSARIAL_WITH_COMMENTARY = """This question has NO correct answer in the conversation. Score the prediction and (if it failed) emit a failure_category.
+
+- 1.0: Prediction says it doesn't know / not mentioned / no information
+- 0.5: Prediction is vague or uncertain
+- 0.0: Prediction gives a specific fabricated answer (hallucination)
+
+If score < 1.0, failure_category must be one of: hallucination, grounding_error, ambiguous.
+If score == 1.0, failure_category is null.
+
+CRITICAL: Do NOT mention specific entities/dates/names; do NOT explain the correct answer.
+Output ONLY JSON — no prose, no markdown.
+
+Question: {question}
+Prediction: {prediction}
+
+Output: {{"score": 0.0|0.5|1.0, "failure_category": "<category-or-null>"}}"""
+
+# Allowed failure categories (enforced server-side — any deviation falls back
+# to "ambiguous" so optimizer never sees free-form judge text).
+_ALLOWED_FAILURE_CATEGORIES = {
+    "retrieval_miss",
+    "grounding_error",
+    "temporal_misalignment",
+    "aggregation_incomplete",
+    "reasoning_error",
+    "hallucination",
+    "ambiguous",
+}
+
 class LLMJudge:
-    def __init__(self, model: str = "MiniMax-M2.5"):
+    def __init__(self, model: str = "MiniMax-M2.5", emit_commentary: bool = False):
         # Auto-select API config: GLM models use GLM_BASE_URL/GLM_API_KEY,
         # others fall back to OPENAI_* env vars.
         if "glm" in model.lower():
@@ -868,8 +945,26 @@ class LLMJudge:
         else:
             self.client = OpenAI()
         self.model = model
+        # No-leak Phase B: when True, judge emits structured failure_category
+        # from a fixed vocabulary alongside the score, with strict prompt-level
+        # constraints against leaking gold answer contents.
+        self.emit_commentary = emit_commentary
 
-    def score(self, question: str, reference: str, prediction: str, category: str = "") -> float:
+    def score(
+        self, question: str, reference: str, prediction: str, category: str = ""
+    ) -> float | tuple[float, str]:
+        """Score a prediction.
+
+        Returns:
+            float when emit_commentary=False (legacy behavior)
+            (score, failure_category) when emit_commentary=True.
+            failure_category is "" for score==1.0 or when classification fails.
+        """
+        if self.emit_commentary:
+            return self._score_with_commentary(question, reference, prediction, category)
+        return self._score_plain(question, reference, prediction, category)
+
+    def _score_plain(self, question: str, reference: str, prediction: str, category: str) -> float:
         if category == "adversarial":
             prompt = JUDGE_PROMPT_ADVERSARIAL.format(
                 question=question,
@@ -904,6 +999,78 @@ class LLMJudge:
         print(f"    [judge warn] cannot parse score: {raw[:80]!r}")
         return 0.0
 
+    def _score_with_commentary(
+        self, question: str, reference: str, prediction: str, category: str
+    ) -> tuple[float, str]:
+        """Score + constrained-vocabulary failure_category (no-leak mode)."""
+        import re as _re
+
+        if category == "adversarial":
+            prompt = JUDGE_PROMPT_ADVERSARIAL_WITH_COMMENTARY.format(
+                question=question,
+                prediction=prediction,
+            )
+        else:
+            prompt = JUDGE_PROMPT_WITH_COMMENTARY.format(
+                question=question,
+                reference=reference,
+                prediction=prediction,
+            )
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=4096,
+            timeout=90,
+        )
+        raw = resp.choices[0].message.content.strip()
+        cleaned = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL).strip()
+
+        # Try structured parse first — we REQUIRE JSON.
+        score_val: float | None = None
+        failure_cat: str = ""
+        json_match = _re.search(r"\{[\s\S]*\}", cleaned)
+        if json_match:
+            try:
+                parsed = json.loads(json_match.group())
+                s_raw = parsed.get("score")
+                if isinstance(s_raw, (int, float)):
+                    s_f = float(s_raw)
+                    if s_f in (0.0, 0.5, 1.0):
+                        score_val = s_f
+                fc_raw = parsed.get("failure_category")
+                if isinstance(fc_raw, str) and fc_raw in _ALLOWED_FAILURE_CATEGORIES:
+                    failure_cat = fc_raw
+                elif fc_raw in (None, "", "null"):
+                    failure_cat = ""
+                else:
+                    # Judge drifted off vocabulary — coerce to "ambiguous" to
+                    # prevent any free-form string from reaching the optimizer.
+                    failure_cat = "ambiguous"
+            except json.JSONDecodeError:
+                pass
+
+        # Fallback: bare number (same as plain path) when JSON parse failed.
+        if score_val is None:
+            match = _re.search(r"\b(1\.0|0\.5|0\.0)\b", cleaned)
+            if match:
+                score_val = float(match.group(1))
+            else:
+                matches = _re.findall(r"\b(1\.0|0\.5|0\.0)\b", raw)
+                if matches:
+                    score_val = float(matches[-1])
+                else:
+                    print(f"    [judge warn] cannot parse JSON or score: {raw[:100]!r}")
+                    score_val = 0.0
+
+        # Enforce: score 1.0 ⇒ no failure_category; score < 1.0 ⇒ require one.
+        if score_val >= 1.0:
+            failure_cat = ""
+        elif not failure_cat:
+            failure_cat = "ambiguous"
+
+        return score_val, failure_cat
+
 # ─────────────────────────────────────────────
 # 评测主流程
 # ─────────────────────────────────────────────
@@ -920,7 +1087,12 @@ def run_eval(
     answer_api_key: str = "",
 ) -> list[EvalResult]:
 
-    judge = LLMJudge(model=judge_model)
+    # No-leak Phase B: when NO_LEAK=1 env is set, judge emits a constrained-vocab
+    # failure_category so the MetaOptimizer runner can build gold-free prompts.
+    _no_leak_mode = os.environ.get("NO_LEAK", "0") == "1"
+    judge = LLMJudge(model=judge_model, emit_commentary=_no_leak_mode)
+    if _no_leak_mode:
+        print("  [NO_LEAK=1] judge will emit constrained-vocab failure_category")
     all_results: list[EvalResult] = []
 
     for strategy in strategies:
@@ -953,8 +1125,13 @@ def run_eval(
                 if hasattr(agent.memory, 'record_feedback'):
                     agent.memory.record_feedback(prediction)
 
+                failure_category = ""
                 try:
-                    score = judge.score(qa.question, qa.answer, prediction, category=qa.category)
+                    judge_out = judge.score(qa.question, qa.answer, prediction, category=qa.category)
+                    if isinstance(judge_out, tuple):
+                        score, failure_category = judge_out
+                    else:
+                        score = judge_out
                 except Exception as e:
                     print(f"    [judge error] {type(e).__name__}: {str(e)[:60]}, defaulting 0.0")
                     score = 0.0
@@ -964,6 +1141,11 @@ def run_eval(
                 # Online reward feedback for adaptive strategies
                 if hasattr(strategy, 'update_reward'):
                     strategy.update_reward(qa.question, score)
+
+                # Option D: capture per-QA retrieval metrics if the strategy
+                # exposed them during retrieve(). Strategy-agnostic — any
+                # strategy that sets _last_retrieval_metrics will contribute.
+                retrieval_metrics = dict(getattr(strategy, "_last_retrieval_metrics", {}) or {})
 
                 result = EvalResult(
                     strategy_name=strategy.name,
@@ -977,6 +1159,8 @@ def run_eval(
                     latency_ms=latency_ms,
                     tokens_used=tokens,
                     arm_id=arm_id if arm_id is not None else -1,
+                    failure_category=failure_category,
+                    retrieval_metrics=retrieval_metrics,
                 )
                 all_results.append(result)
 
@@ -1045,6 +1229,8 @@ def save_results(results: list[EvalResult], output_path: str):
             "latency_ms": r.latency_ms,
             "tokens_used": r.tokens_used,
             "arm_id": r.arm_id,
+            "failure_category": r.failure_category,
+            "retrieval_metrics": r.retrieval_metrics,
         }
         for r in results
     ]
@@ -1404,7 +1590,7 @@ def main():
     parser.add_argument("--data", required=True, help="LoCoMo 数据路径 (locomo10.json)")
     parser.add_argument(
         "--strategy", default="all",
-        choices=["all", "no_memory", "full_history", "rag", "mem0", "memos", "openviking", "meta_skill", "src_memory"],
+        choices=["all", "no_memory", "full_history", "rag", "mem0", "memos", "openviking", "meta_skill", "src_memory", "v1_memory"],
         help="要评测的 memory 策略"
     )
     parser.add_argument("--model", default="MiniMax-M2.5", help="答题模型")
@@ -1455,6 +1641,10 @@ def main():
             if not _SRC_MEMORY_AVAILABLE:
                 raise RuntimeError("SrcMemoryStrategy not available — check sys.path")
             return SrcMemoryStrategy(mode=args.mode, chunk_size=args.chunk_size)
+        if name == "v1_memory":
+            if not _V1_MEMORY_AVAILABLE:
+                raise RuntimeError("V1MemoryStrategy not available — check sys.path")
+            return V1MemoryStrategy()
         raise ValueError(f"未知策略: {name}")
 
     strategy_names = ["no_memory", "full_history", "rag", "mem0"] if args.strategy == "all" else [args.strategy]

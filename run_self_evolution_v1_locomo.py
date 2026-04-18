@@ -267,6 +267,80 @@ def _aggregate_retrieval_metrics(round_results: dict) -> dict:
     return out
 
 
+def _collect_failure_samples(round_results: dict, max_samples: int = 10) -> list:
+    """Extract up to max_samples failed QA records for the audit trail."""
+    failures = []
+    for cat, data in round_results.items():
+        for d in data.get("details", []):
+            if d.get("score", 1.0) < 1.0:
+                failures.append({
+                    "question": str(d.get("question", ""))[:200],
+                    "prediction": str(d.get("prediction", ""))[:200],
+                    "failure_category": d.get("failure_category", ""),
+                    "score": d.get("score", 0.0),
+                    "category": cat,
+                    "sample_id": d.get("sample_id", ""),
+                })
+                if len(failures) >= max_samples:
+                    return failures
+    return failures
+
+
+def write_round_audit(
+    results_dir: str,
+    round_num: int,
+    policy_snapshot: dict,
+    round_results: dict,
+    overall_score: float,
+    metaoptimizer_prompt: str | None,
+    metaoptimizer_raw_response: str | None,
+    parsed_proposals: list,
+    applied_proposal: dict | None,
+    skipped_proposals: list,
+    queued_for_future: list,
+    rollback_should: bool | None,
+    rollback_reason: str | None,
+    variance_decision: str | None,
+) -> None:
+    """Append one JSONL audit record for this round to round_<N>_audit.jsonl."""
+    import datetime
+
+    per_cat_scores = {cat: data["score"] for cat, data in round_results.items() if data["n"] > 0}
+    retrieval_metrics = _aggregate_retrieval_metrics(round_results)
+
+    audit_record = {
+        "round": round_num,
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "policy_snapshot": policy_snapshot,
+        "eval_summary": {
+            "overall": overall_score,
+            "per_cat": per_cat_scores,
+            "per_conv": {},  # conv-level breakdown not tracked at this granularity
+        },
+        "failure_sample": _collect_failure_samples(round_results, max_samples=10),
+        "retrieval_metrics_summary": retrieval_metrics,
+        "metaoptimizer_call": {
+            "full_prompt": metaoptimizer_prompt or "",
+            "raw_response": metaoptimizer_raw_response or "",
+            "parsed_proposals": parsed_proposals,
+        },
+        "decision": {
+            "applied_proposal": applied_proposal,
+            "skipped_proposals": skipped_proposals,
+            "queued_for_future": queued_for_future,
+        },
+        "rollback_decision": {
+            "should_rollback": rollback_should,
+            "reason": rollback_reason or "",
+            "variance_decision": variance_decision or "",
+        },
+    }
+
+    audit_path = os.path.join(results_dir, f"round_{round_num}_audit.jsonl")
+    with open(audit_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(audit_record, ensure_ascii=False) + "\n")
+
+
 def build_meta_optimizer_prompt(
     round_results: dict,
     current_policy: dict,
@@ -528,20 +602,24 @@ def _llm_once(prompt: str) -> str:
     raise RuntimeError(f"LLM call failed after 3 rate-limit retries: {last_error}")
 
 
-def call_llm(prompt: str) -> dict:
+def call_llm(prompt: str) -> tuple[dict, str]:
     """Call LLM to get MetaOptimizer proposals.
 
     P0-fix 3.4: schema retry — if response doesn't parse or fails schema validation,
     retry up to 3 times appending an error hint to the prompt.
+
+    Returns (parsed_dict, raw_response_text).
     """
     cur_prompt = prompt
     last_err = None
+    raw_text = ""
     for parse_attempt in range(3):
         try:
             text = _llm_once(cur_prompt)
+            raw_text = text
         except Exception as e:
             print(f"  LLM call failed (parse attempt {parse_attempt+1}/3): {e}")
-            return {"analysis": f"LLM call failed: {e}", "proposals": []}
+            return {"analysis": f"LLM call failed: {e}", "proposals": []}, ""
 
         # Parse JSON from response
         json_match = re.search(r'\{[\s\S]*\}', text)
@@ -571,7 +649,7 @@ def call_llm(prompt: str) -> dict:
             _validate_schema(parsed)
             if parse_attempt > 0:
                 print(f"  status: parse retry {parse_attempt+1}/3 succeeded")
-            return parsed
+            return parsed, raw_text
         except AssertionError as e:
             last_err = f"schema validation: {e}"
             print(f"  status: parse retry {parse_attempt+1}/3 — {last_err}")
@@ -584,7 +662,7 @@ def call_llm(prompt: str) -> dict:
             continue
 
     print(f"  status: parse failed after 3 retries — {last_err}")
-    return {"analysis": f"Failed to parse LLM response after 3 retries: {last_err}", "proposals": []}
+    return {"analysis": f"Failed to parse LLM response after 3 retries: {last_err}", "proposals": []}, raw_text
 
 
 def apply_proposals(
@@ -592,10 +670,10 @@ def apply_proposals(
     proposals: list,
     min_confidence: float = 0.5,
     banned: list | None = None,
-) -> tuple[dict, dict | None]:
+) -> tuple[dict, dict | None, list, list]:
     """Apply ONLY the top-1 proposal (sequential atom trial — P0-fix 3.2).
 
-    Returns (new_policy, applied_proposal_or_None).
+    Returns (new_policy, applied_proposal_or_None, skipped_proposals, queued_for_future).
     Skips proposals that are: below min_confidence, unknown param, no-op (same value),
     or in the banned list (already rolled-back).
     """
@@ -605,41 +683,47 @@ def apply_proposals(
 
     # Filter and rank by confidence
     candidates = []
+    skipped_proposals = []
     for p in proposals:
         param = p.get("param", "")
         value = p.get("value")
         conf = p.get("confidence", 0)
         if conf < min_confidence:
             print(f"  Skipping '{param}' (confidence={conf:.2f} < {min_confidence})")
+            skipped_proposals.append({**p, "_skip_reason": f"confidence={conf:.2f} < {min_confidence}"})
             continue
         if param not in new_policy:
             print(f"  Skipping unknown param '{param}'")
+            skipped_proposals.append({**p, "_skip_reason": f"unknown param '{param}'"})
             continue
         if new_policy[param] == value:
             print(f"  Skipping no-op '{param}={value!r}' (already current)")
+            skipped_proposals.append({**p, "_skip_reason": "no-op (same value)"})
             continue
         key = (param, json.dumps(value, sort_keys=True))
         if key in banned_keys:
             print(f"  Skipping banned (rolled-back) proposal '{param}={value!r}'")
+            skipped_proposals.append({**p, "_skip_reason": "banned (previously rolled-back)"})
             continue
         candidates.append(p)
 
     if not candidates:
         print("  No applicable proposals (after filtering); policy unchanged.")
-        return new_policy, None
+        return new_policy, None, skipped_proposals, []
 
     candidates.sort(key=lambda p: -p.get("confidence", 0))
     top = candidates[0]
     new_policy[top["param"]] = top["value"]
+    queued_for_future = candidates[1:]
 
-    queued = [f"{p['param']}={p['value']!r}@{p.get('confidence',0):.2f}" for p in candidates[1:]]
+    queued_labels = [f"{p['param']}={p['value']!r}@{p.get('confidence',0):.2f}" for p in queued_for_future]
     print(
         f"  Applied TOP-1 proposal: {top['param']}={top['value']!r} "
         f"(confidence={top.get('confidence', 0):.2f})"
     )
-    if queued:
-        print(f"  Queued for future rounds (not applied this round): {queued}")
-    return new_policy, top
+    if queued_labels:
+        print(f"  Queued for future rounds (not applied this round): {queued_labels}")
+    return new_policy, top, skipped_proposals, queued_for_future
 
 
 def main():
@@ -691,6 +775,17 @@ def main():
         print(f"Round {round_num}")
         print(f"{'='*60}")
 
+        # Audit state for this round (populated incrementally, written at end)
+        _audit_prompt: str | None = None
+        _audit_raw_response: str | None = None
+        _audit_parsed_proposals: list = []
+        _audit_applied: dict | None = None
+        _audit_skipped: list = []
+        _audit_queued: list = []
+        _audit_rollback_should: bool | None = None
+        _audit_rollback_reason: str | None = None
+        _audit_variance_decision: str | None = None
+
         # Step 2a: Run eval (all QA from conv-26 + conv-30, ~200 QA)
         print("Running LoCoMo eval...")
         results = run_eval_round(round_num, args.results_dir, args.policy_path, no_leak=args.no_leak)
@@ -724,8 +819,11 @@ def main():
                     prev_per_cat=prev_entry.get("per_cat", {}),
                     cur_per_cat=cur_per_cat_scores,
                 )
+                _audit_variance_decision = variance_decision
                 print(f"  variance_decision: {variance_decision}")
                 if should_rb:
+                    _audit_rollback_should = True
+                    _audit_rollback_reason = f"regression {prev_entry['avg_score']:.3f} -> {avg:.3f}"
                     # Regression exceeds variance floor: roll back
                     prev_policy = prev_entry["policy"]
                     print(
@@ -761,6 +859,9 @@ def main():
                     # Save rollback history immediately so partial runs are inspectable
                     with open(os.path.join(args.results_dir, "evolution_history.json"), "w") as f:
                         json.dump(history, f, indent=2, ensure_ascii=False)
+                else:
+                    _audit_rollback_should = False
+                    _audit_rollback_reason = variance_decision
 
         if not rolled_back:
             history.append({
@@ -795,6 +896,7 @@ def main():
                 banned_proposals=banned_proposals,
                 no_leak=args.no_leak,
             )
+            _audit_prompt = prompt
 
             # Save prompt for debugging
             with open(os.path.join(args.results_dir, f"round{round_num}_prompt.txt"), "w") as f:
@@ -804,7 +906,8 @@ def main():
             time.sleep(30)
 
             # Step 2e: Call LLM (with schema retry — P0-fix 3.4)
-            llm_response = call_llm(prompt)
+            llm_response, raw_text = call_llm(prompt)
+            _audit_raw_response = raw_text
 
             # Save LLM response
             with open(os.path.join(args.results_dir, f"round{round_num}_response.json"), "w") as f:
@@ -814,16 +917,38 @@ def main():
 
             # Step 2f: Apply proposals (top-1 only — P0-fix 3.2)
             proposals = llm_response.get("proposals", [])
-            current_policy, applied = apply_proposals(
+            _audit_parsed_proposals = proposals
+            current_policy, applied, skipped, queued = apply_proposals(
                 current_policy, proposals, args.min_confidence, banned=banned_proposals
             )
             last_applied_proposal = applied
+            _audit_applied = applied
+            _audit_skipped = skipped
+            _audit_queued = queued
 
             # Step 2g: Write updated policy JSON
             with open(args.policy_path, "w") as f:
                 json.dump(current_policy, f, indent=2)
             print(f"  Updated policy written to {args.policy_path}")
             print(f"  New policy: {json.dumps(current_policy)}")
+
+        # Step 2h: Write audit JSONL for this round (always, even if last round / no LLM call)
+        write_round_audit(
+            results_dir=args.results_dir,
+            round_num=round_num,
+            policy_snapshot=dict(current_policy),
+            round_results=results,
+            overall_score=avg,
+            metaoptimizer_prompt=_audit_prompt,
+            metaoptimizer_raw_response=_audit_raw_response,
+            parsed_proposals=_audit_parsed_proposals,
+            applied_proposal=_audit_applied,
+            skipped_proposals=_audit_skipped,
+            queued_for_future=_audit_queued,
+            rollback_should=_audit_rollback_should,
+            rollback_reason=_audit_rollback_reason,
+            variance_decision=_audit_variance_decision,
+        )
 
         # Update prev_results: use this round's results if accepted; otherwise keep the last good
         if not rolled_back:

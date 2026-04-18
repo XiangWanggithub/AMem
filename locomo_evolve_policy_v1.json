@@ -1,11 +1,11 @@
 {
-  "card_pool_size": 40,
-  "episode_top_k": 10,
-  "bm25_weight": 0.2,
-  "similarity_threshold": 0.7,
+  "card_pool_size": 20,
+  "episode_top_k": 3,
+  "bm25_weight": 0.0,
+  "similarity_threshold": 0.6,
   "recency_weight": 0.0,
-  "use_ce_rerank": true,
-  "use_entity_boost": true,
+  "use_ce_rerank": false,
+  "use_entity_boost": false,
   "use_temporal_boost": false,
   "use_l1_enrichment": false
 }

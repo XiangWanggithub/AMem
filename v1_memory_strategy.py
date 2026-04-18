@@ -397,9 +397,10 @@ class V1MemoryStrategy:
         so the LLM can resolve relative-time references in the question against
         an absolute reference point. No instruction is added — only the fact.
 
-        query_type: optional query category (e.g. "multi-hop", "temporal").
+        query_type: optional query category (e.g. "multi_hop", "temporal_reasoning").
         When provided AND a ConditionalPolicy with matching override is loaded,
         the override policy is used for this query instead of the default.
+        If empty and overrides exist, QueryTypeClassifier is used to infer it.
         """
         if not query:
             self._last_retrieval_metrics = {}
@@ -407,9 +408,32 @@ class V1MemoryStrategy:
         self._ensure_init()
         assert self._retrieval_pipeline is not None
 
-        # Select policy based on query_type (conditional policy dispatch)
+        # Select policy based on query_type (conditional policy dispatch).
+        # When caller doesn't pass query_type (e.g. eval_pipeline.AgentLoop.answer)
+        # AND the loaded ConditionalPolicy has overrides, classify the query
+        # via QueryTypeClassifier so per-type overrides actually fire.
         assert self._conditional_policy is not None
-        policy = self._conditional_policy.get_policy(query_type)
+        effective_type = query_type
+        if not effective_type and self._conditional_policy.overrides:
+            try:
+                from src.skills.retrieve.query_type_classifier import (  # noqa: PLC0415
+                    classify_query,
+                )
+                effective_type = classify_query(query).value
+            except Exception as _ce:  # noqa: BLE001
+                # Classifier must never block retrieval — fall back to default.
+                print(f"[V1Memory] query classify failed ({_ce}), using default policy")
+                effective_type = ""
+        policy = self._conditional_policy.get_policy(effective_type)
+        if os.environ.get("V1_POLICY_DEBUG") == "1":
+            _using = "override" if policy is not self._policy else "default"
+            print(
+                f"[V1Policy] type={effective_type or '<empty>'} "
+                f"using={_using} "
+                f"card_pool_size={policy.card_pool_size} "
+                f"episode_top_k={policy.episode_top_k} "
+                f"use_l1_enrichment={policy.use_l1_enrichment}"
+            )
         if policy is not self._policy:
             # Hot-swap the pipeline's policy for this query
             self._retrieval_pipeline.policy = policy

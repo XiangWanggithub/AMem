@@ -51,6 +51,7 @@ Agent 记忆系统评测框架
 
 import json
 import argparse
+import asyncio
 import time
 import os
 import re
@@ -60,7 +61,7 @@ from abc import ABC, abstractmethod
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 
 # 自动加载项目根目录的 .env 文件
 try:
@@ -89,6 +90,38 @@ try:
     _V1_MEMORY_AVAILABLE = True
 except ImportError:
     _V1_MEMORY_AVAILABLE = False
+
+# ─────────────────────────────────────────────
+# API stability: sustained-failure detection + token-bucket rate limiter
+# ─────────────────────────────────────────────
+
+class SustainedFailureError(RuntimeError):
+    """Raised when consecutive empty predictions exceed the configured threshold.
+    Signals that the API is effectively unreachable and eval should abort."""
+    pass
+
+
+# Module-level counter.  Reset to 0 on every successful prediction; incremented
+# on every fallback-to-empty.  Not thread-safe but safe for asyncio single-loop.
+_consecutive_empty_predictions: int = 0
+SUSTAINED_FAILURE_THRESHOLD: int = int(os.environ.get("SUSTAINED_FAILURE_THRESHOLD", "20"))
+
+# Token-bucket rate limiter: global semaphore caps burst QPS at 6 concurrent
+# in-flight API calls (matches MiniMax burst limit observed in prod).
+# Each call acquires before sending and releases immediately after; combined with
+# per-call exponential backoff this prevents thundering-herd 429 cascades.
+_API_BURST_SEM: asyncio.Semaphore  # initialised lazily in _get_api_sem()
+
+
+def _get_api_sem() -> asyncio.Semaphore:
+    """Return (and lazily create) the module-level API burst semaphore."""
+    global _API_BURST_SEM
+    try:
+        return _API_BURST_SEM
+    except NameError:
+        _API_BURST_SEM = asyncio.Semaphore(int(os.environ.get("API_BURST_CONCURRENCY", "6")))
+        return _API_BURST_SEM
+
 
 # ─────────────────────────────────────────────
 # 数据结构
@@ -1075,6 +1108,473 @@ class LLMJudge:
 # 评测主流程
 # ─────────────────────────────────────────────
 
+@dataclass
+class _PreparedAnswer:
+    """Output of the sync retrieve + prompt-build phase."""
+    create_kwargs: dict
+    arm_id: int
+    retrieval_metrics: dict
+
+
+def _prepare_answer_request(agent: "AgentLoop", question: str) -> _PreparedAnswer:
+    """Run non-LLM part of AgentLoop.answer(): retrieve, prompt assembly,
+    diagnostics capture. Must be called sequentially per strategy since
+    memory.retrieve() mutates shared strategy state."""
+    memory = agent.memory
+    if hasattr(memory, "_rewrite_query"):
+        context = memory.retrieve(question, client=agent.client)
+    else:
+        context = memory.retrieve(question)
+
+    arm_id = getattr(memory, "_last_arm_id_used", -1)
+    if arm_id is None:
+        arm_id = -1
+
+    is_inference = _is_multihop_inference_query(question)
+    active_system_prompt = SYSTEM_PROMPT_INFERENCE if is_inference else SYSTEM_PROMPT
+
+    if hasattr(memory, "get_ce_answerability") and not is_inference:
+        ce_score = memory.get_ce_answerability()
+        if ce_score is not None and ce_score < _O5B_CE_THRESHOLD:
+            active_system_prompt = SYSTEM_PROMPT + "\n" + _IDK_INSTRUCTION
+    elif hasattr(memory, "get_retrieval_confidence") and not is_inference:
+        conf = memory.get_retrieval_confidence()
+        _arm = getattr(memory, "_last_arm_id_used", None)
+        is_ce_arm = _arm is not None and _arm >= 3
+        if _is_temporal_query(question):
+            cosine_thresh = _O4_TEMPORAL_THRESHOLD
+        else:
+            cosine_thresh = _O4_COSINE_THRESHOLD
+        threshold = _O4_CE_THRESHOLD if is_ce_arm else cosine_thresh
+        if conf < threshold:
+            active_system_prompt = SYSTEM_PROMPT + "\n" + _IDK_INSTRUCTION
+
+    messages = [{"role": "system", "content": active_system_prompt}]
+    if context:
+        messages.append({
+            "role": "user",
+            "content": f"[Memory Context]\n{context}\n\n[Question]\n{question}",
+        })
+    else:
+        messages.append({"role": "user", "content": f"[Question]\n{question}"})
+
+    create_kwargs = dict(
+        model=agent.model,
+        messages=messages,
+        temperature=0,
+        max_tokens=1024,
+        timeout=60,
+    )
+    if agent._is_glm:
+        create_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+
+    retrieval_metrics = dict(getattr(memory, "_last_retrieval_metrics", {}) or {})
+    return _PreparedAnswer(
+        create_kwargs=create_kwargs,
+        arm_id=arm_id,
+        retrieval_metrics=retrieval_metrics,
+    )
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return "429" in s or "rate" in s or "too many request" in s
+
+
+def _is_server_error(exc: Exception) -> bool:
+    s = str(exc)
+    return any(code in s for code in ("500", "502", "503", "504"))
+
+
+async def _async_chat_with_retry(
+    client: AsyncOpenAI,
+    create_kwargs: dict,
+    *,
+    label: str,
+    sem: asyncio.Semaphore,
+) -> tuple[Optional[object], float, Optional[str]]:
+    """Call chat.completions.create under semaphore with retries.
+
+    429: exponential backoff 2/4/8/16/32s + uniform jitter ±20%; 5 retries.
+    5xx: 1/2/4/8/16s + jitter; 5 retries.
+    Also acquires the module-level _API_BURST_SEM to honour MiniMax burst limit.
+    """
+    import random as _random
+    t0 = time.time()
+    last_err: Optional[str] = None
+    # Phase 1.7: 5 retries (was 3) — max cumulative sleep ~62s before jitter
+    rate_delays = [2, 4, 8, 16, 32]
+    server_delays = [1, 2, 4, 8, 16]
+    max_retries = 5
+    api_sem = _get_api_sem()
+    for attempt in range(max_retries + 1):
+        try:
+            async with api_sem:        # token-bucket: honour burst cap
+                async with sem:        # caller-supplied role-level semaphore
+                    resp = await client.chat.completions.create(**create_kwargs)
+            return (resp, time.time() - t0, None)
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {str(e)[:120]}"
+            if attempt >= max_retries:
+                break
+            if _is_rate_limited(e):
+                base = rate_delays[min(attempt, len(rate_delays) - 1)]
+                wait = base * (1 + _random.uniform(-0.2, 0.2))
+                print(f"    [{label} retry] 429 attempt {attempt+1}/{max_retries}, sleep {wait:.1f}s")
+                await asyncio.sleep(wait)
+                continue
+            if _is_server_error(e):
+                base = server_delays[min(attempt, len(server_delays) - 1)]
+                wait = base * (1 + _random.uniform(-0.2, 0.2))
+                print(f"    [{label} retry] 5xx attempt {attempt+1}/{max_retries}, sleep {wait:.1f}s")
+                await asyncio.sleep(wait)
+                continue
+            break
+    return (None, time.time() - t0, last_err)
+
+
+async def _async_answer_llm(
+    async_client: AsyncOpenAI,
+    prepared: _PreparedAnswer,
+    sem: asyncio.Semaphore,
+) -> tuple[str, float, int]:
+    """Async LLM answer call. Returns (prediction, latency_ms, tokens).
+
+    Phase 1.7: tracks module-level _consecutive_empty_predictions counter.
+    Raises SustainedFailureError if threshold is exceeded so the caller can
+    abort the eval instead of continuing with silent empty predictions.
+    """
+    global _consecutive_empty_predictions
+    resp, elapsed, err = await _async_chat_with_retry(
+        async_client, prepared.create_kwargs, label="answer", sem=sem
+    )
+    if resp is None:
+        _consecutive_empty_predictions += 1
+        print(
+            f"    [answer error] {err}, using empty prediction "
+            f"(consecutive_empty={_consecutive_empty_predictions})"
+        )
+        if _consecutive_empty_predictions >= SUSTAINED_FAILURE_THRESHOLD:
+            raise SustainedFailureError(
+                f"API unreachable: {_consecutive_empty_predictions} consecutive empty "
+                f"predictions (threshold={SUSTAINED_FAILURE_THRESHOLD}). "
+                f"Last error: {err}"
+            )
+        return ("", 0.0, 0)
+    try:
+        raw = (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        print(f"    [answer parse] {type(e).__name__}: {e}")
+        _consecutive_empty_predictions += 1
+        if _consecutive_empty_predictions >= SUSTAINED_FAILURE_THRESHOLD:
+            raise SustainedFailureError(
+                f"API parse failures: {_consecutive_empty_predictions} consecutive empties "
+                f"(threshold={SUSTAINED_FAILURE_THRESHOLD})"
+            )
+        return ("", elapsed * 1000.0, 0)
+    # Successful response — reset the sustained-failure counter
+    _consecutive_empty_predictions = 0
+    tokens = 0
+    try:
+        tokens = int(resp.usage.total_tokens) if resp.usage else 0
+    except Exception:
+        tokens = 0
+    import re as _re
+    cleaned = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL).strip()
+    prediction = cleaned if cleaned else raw
+    return (prediction, elapsed * 1000.0, tokens)
+
+
+async def _async_judge_score(
+    judge: "LLMJudge",
+    async_client: AsyncOpenAI,
+    sem: asyncio.Semaphore,
+    question: str,
+    reference: str,
+    prediction: str,
+    category: str,
+) -> tuple[float, str]:
+    """Async judge scoring — returns (score, failure_category).
+    failure_category is '' when emit_commentary is False or score==1.0."""
+    import re as _re
+    if judge.emit_commentary:
+        if category == "adversarial":
+            prompt = JUDGE_PROMPT_ADVERSARIAL_WITH_COMMENTARY.format(
+                question=question, prediction=prediction,
+            )
+        else:
+            prompt = JUDGE_PROMPT_WITH_COMMENTARY.format(
+                question=question, reference=reference, prediction=prediction,
+            )
+    else:
+        if category == "adversarial":
+            prompt = JUDGE_PROMPT_ADVERSARIAL.format(
+                question=question, prediction=prediction,
+            )
+        else:
+            prompt = JUDGE_PROMPT.format(
+                question=question, reference=reference, prediction=prediction,
+            )
+    create_kwargs = dict(
+        model=judge.model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        max_tokens=4096,
+        timeout=90,
+    )
+    resp, _elapsed, err = await _async_chat_with_retry(
+        async_client, create_kwargs, label="judge", sem=sem
+    )
+    if resp is None:
+        print(f"    [judge error] {err}, defaulting 0.0")
+        return (0.0, "ambiguous" if judge.emit_commentary else "")
+    try:
+        raw = (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        print(f"    [judge parse] {type(e).__name__}: {e}")
+        return (0.0, "ambiguous" if judge.emit_commentary else "")
+
+    cleaned = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL).strip()
+
+    if not judge.emit_commentary:
+        match = _re.search(r"\b(1\.0|0\.5|0\.0)\b", cleaned)
+        if match:
+            return (float(match.group(1)), "")
+        matches = _re.findall(r"\b(1\.0|0\.5|0\.0)\b", raw)
+        if matches:
+            return (float(matches[-1]), "")
+        print(f"    [judge warn] cannot parse score: {raw[:80]!r}")
+        return (0.0, "")
+
+    score_val: Optional[float] = None
+    failure_cat: str = ""
+    json_match = _re.search(r"\{[\s\S]*\}", cleaned)
+    if json_match:
+        try:
+            parsed = json.loads(json_match.group())
+            s_raw = parsed.get("score")
+            if isinstance(s_raw, (int, float)):
+                s_f = float(s_raw)
+                if s_f in (0.0, 0.5, 1.0):
+                    score_val = s_f
+            fc_raw = parsed.get("failure_category")
+            if isinstance(fc_raw, str) and fc_raw in _ALLOWED_FAILURE_CATEGORIES:
+                failure_cat = fc_raw
+            elif fc_raw in (None, "", "null"):
+                failure_cat = ""
+            else:
+                failure_cat = "ambiguous"
+        except json.JSONDecodeError:
+            pass
+    if score_val is None:
+        match = _re.search(r"\b(1\.0|0\.5|0\.0)\b", cleaned)
+        if match:
+            score_val = float(match.group(1))
+        else:
+            matches = _re.findall(r"\b(1\.0|0\.5|0\.0)\b", raw)
+            if matches:
+                score_val = float(matches[-1])
+            else:
+                print(f"    [judge warn] cannot parse JSON or score: {raw[:100]!r}")
+                score_val = 0.0
+    if score_val >= 1.0:
+        failure_cat = ""
+    elif not failure_cat:
+        failure_cat = "ambiguous"
+    return (score_val, failure_cat)
+
+
+async def _run_async_impl(
+    conversations: list[Conversation],
+    strategies: list[MemoryStrategy],
+    model: str,
+    judge_model: str,
+    max_qa_per_conv: int,
+    categories: Optional[list[str]],
+    max_sessions: int,
+    answer_base_url: str,
+    answer_api_key: str,
+    answer_concurrency: int,
+    judge_concurrency: int,
+) -> list[EvalResult]:
+    _no_leak_mode = os.environ.get("NO_LEAK", "0") == "1"
+    judge = LLMJudge(model=judge_model, emit_commentary=_no_leak_mode)
+    if _no_leak_mode:
+        print("  [NO_LEAK=1] judge will emit constrained-vocab failure_category")
+
+    answer_client = AsyncOpenAI(
+        base_url=(answer_base_url or os.environ.get("OPENAI_BASE_URL", "") or None),
+        api_key=(answer_api_key or os.environ.get("OPENAI_API_KEY", "")),
+        timeout=90.0,
+    )
+    if "glm" in judge_model.lower():
+        judge_base = os.environ.get("GLM_BASE_URL", "")
+        judge_key = os.environ.get("GLM_API_KEY", "")
+    else:
+        judge_base = os.environ.get("OPENAI_BASE_URL", "")
+        judge_key = os.environ.get("OPENAI_API_KEY", "")
+    judge_async_client = AsyncOpenAI(
+        base_url=(judge_base or None),
+        api_key=judge_key,
+        timeout=120.0,
+    )
+
+    answer_sem = asyncio.Semaphore(answer_concurrency)
+    judge_sem = asyncio.Semaphore(judge_concurrency)
+
+    print(f"  [async] answer concurrency={answer_concurrency} model={model}")
+    print(f"  [async] judge  concurrency={judge_concurrency} model={judge_model}")
+
+    all_results: list[EvalResult] = []
+
+    for strategy in strategies:
+        print(f"\n{'='*50}")
+        print(f"策略: {strategy.name}")
+        print(f"{'='*50}")
+        agent = AgentLoop(
+            memory=strategy, model=model,
+            answer_base_url=answer_base_url, answer_api_key=answer_api_key,
+        )
+
+        for conv in conversations:
+            print(f"\n  对话: {conv.sample_id}（{len(conv.turns)} 轮, {len(conv.qa_list)} 个 QA）")
+            # Replay in a worker thread: some strategies (e.g. V1MemoryStrategy)
+            # call asyncio.run() inside flush(), which would fail inside our
+            # running event loop. asyncio.to_thread gives flush its own loop.
+            await asyncio.to_thread(
+                agent.replay_conversation, conv.turns, max_sessions
+            )
+
+            qa_subset = conv.qa_list
+            if categories:
+                qa_subset = [q for q in qa_subset if q.category in categories]
+            qa_subset = qa_subset[:max_qa_per_conv]
+            n = len(qa_subset)
+            if n == 0:
+                continue
+
+            # Phase 1: sync retrieval per QA, also via thread so any
+            # asyncio.run inside retrieve() (e.g. V1Memory's embed/ce) works.
+            async def _prepare_all():
+                out: list[Optional[_PreparedAnswer]] = [None] * n
+                for i, qa in enumerate(qa_subset):
+                    try:
+                        out[i] = await asyncio.to_thread(
+                            _prepare_answer_request, agent, qa.question
+                        )
+                    except Exception as e:
+                        print(f"    [prepare error {i+1}/{n}] {type(e).__name__}: {str(e)[:60]}")
+                return out
+            prepared_list = await _prepare_all()
+
+            # Phase 2: async answer LLM calls
+            async def _answer_one(idx: int):
+                p = prepared_list[idx]
+                if p is None:
+                    return ("", 0.0, 0)
+                return await _async_answer_llm(answer_client, p, answer_sem)
+
+            answer_results = await asyncio.gather(
+                *[_answer_one(i) for i in range(n)], return_exceptions=True
+            )
+
+            predictions: list[str] = []
+            latencies: list[float] = []
+            tok_list: list[int] = []
+            arm_ids: list[int] = []
+            retrieval_metrics_list: list[dict] = []
+            for i in range(n):
+                res = answer_results[i]
+                if isinstance(res, Exception):
+                    print(f"    [answer exc {i+1}/{n}] {type(res).__name__}: {str(res)[:60]}")
+                    predictions.append("")
+                    latencies.append(0.0)
+                    tok_list.append(0)
+                else:
+                    pred, lat, tok = res
+                    predictions.append(pred)
+                    latencies.append(lat)
+                    tok_list.append(tok)
+                p = prepared_list[i]
+                arm_ids.append(p.arm_id if p else -1)
+                retrieval_metrics_list.append(p.retrieval_metrics if p else {})
+                if hasattr(agent.memory, "record_feedback"):
+                    try:
+                        agent.memory.record_feedback(predictions[-1])
+                    except Exception as e:
+                        print(f"    [record_feedback {i+1}] {type(e).__name__}: {e}")
+
+            # Phase 3: async judge calls
+            async def _judge_one(idx: int):
+                qa = qa_subset[idx]
+                return await _async_judge_score(
+                    judge, judge_async_client, judge_sem,
+                    qa.question, qa.answer, predictions[idx], qa.category,
+                )
+
+            judge_results = await asyncio.gather(
+                *[_judge_one(i) for i in range(n)], return_exceptions=True
+            )
+
+            # Phase 4: sync post-processing
+            _global_q_idx = len(all_results)
+            for i, qa in enumerate(qa_subset):
+                jres = judge_results[i]
+                if isinstance(jres, Exception):
+                    print(f"    [judge exc {i+1}/{n}] {type(jres).__name__}: {str(jres)[:60]}")
+                    score, failure_category = 0.0, ("ambiguous" if _no_leak_mode else "")
+                else:
+                    score, failure_category = jres
+
+                f1 = compute_f1(predictions[i], qa.answer)
+
+                if hasattr(strategy, "update_reward"):
+                    try:
+                        strategy.update_reward(qa.question, score)
+                    except Exception as e:
+                        print(f"    [update_reward {i+1}] {type(e).__name__}: {e}")
+
+                result = EvalResult(
+                    strategy_name=strategy.name,
+                    sample_id=conv.sample_id,
+                    category=qa.category,
+                    question=qa.question,
+                    reference=qa.answer,
+                    prediction=predictions[i],
+                    judge_score=score,
+                    f1_score=f1,
+                    latency_ms=latencies[i],
+                    tokens_used=tok_list[i],
+                    arm_id=arm_ids[i] if arm_ids[i] is not None else -1,
+                    failure_category=failure_category,
+                    retrieval_metrics=retrieval_metrics_list[i],
+                )
+                all_results.append(result)
+
+                question_index = _global_q_idx + i
+                if (question_index % 50 == 0) and hasattr(strategy, "get_bandit_snapshot"):
+                    snapshot = strategy.get_bandit_snapshot()
+                    snapshot["index"] = question_index
+                    snapshot["timestamp"] = time.time()
+                    os.makedirs("results", exist_ok=True)
+                    with open("results/bandit_evolution.jsonl", "a") as f:
+                        f.write(json.dumps(snapshot) + "\n")
+
+                status = "✓" if score >= 0.5 else "✗"
+                print(
+                    f"    [{i+1}/{n}] {status} judge={score:.1f} f1={f1:.2f} "
+                    f"arm={arm_ids[i]} [{qa.category}] {qa.question[:40]}..."
+                )
+
+    try:
+        await answer_client.close()
+        await judge_async_client.close()
+    except Exception:
+        pass
+
+    return all_results
+
+
 def run_eval(
     conversations: list[Conversation],
     strategies: list[MemoryStrategy],
@@ -1086,6 +1586,30 @@ def run_eval(
     answer_base_url: str = "",
     answer_api_key: str = "",
 ) -> list[EvalResult]:
+
+    # ── Async concurrency dispatch (Phase 1.6) ────────────────────────────
+    # Default: async mode (role-split: MiniMax answers, GLM judges), which
+    # parallelizes LLM calls with asyncio.Semaphore. Sync fallback preserved
+    # via EVAL_CONCURRENCY_MODE=sync.
+    _mode = os.environ.get("EVAL_CONCURRENCY_MODE", "async").lower()
+    if _mode == "async":
+        _ans_conc = int(os.environ.get("EVAL_ANSWER_CONCURRENCY", "8"))
+        _jud_conc = int(os.environ.get("EVAL_JUDGE_CONCURRENCY", "5"))
+        print(f"  [EVAL_CONCURRENCY_MODE=async] answer_conc={_ans_conc} judge_conc={_jud_conc}")
+        return asyncio.run(_run_async_impl(
+            conversations=conversations,
+            strategies=strategies,
+            model=model,
+            judge_model=judge_model,
+            max_qa_per_conv=max_qa_per_conv,
+            categories=categories,
+            max_sessions=max_sessions,
+            answer_base_url=answer_base_url,
+            answer_api_key=answer_api_key,
+            answer_concurrency=_ans_conc,
+            judge_concurrency=_jud_conc,
+        ))
+    print(f"  [EVAL_CONCURRENCY_MODE={_mode}] using sync legacy path")
 
     # No-leak Phase B: when NO_LEAK=1 env is set, judge emits a constrained-vocab
     # failure_category so the MetaOptimizer runner can build gold-free prompts.
